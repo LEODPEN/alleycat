@@ -68,6 +68,12 @@ pub struct StatusInfo {
     pub config_path: String,
     pub uptime_secs: u64,
     pub agents: Vec<AgentInfo>,
+    /// SemVer of the *binary* that's currently running the daemon (e.g.
+    /// `kittylitter 0.2.1`). The CLI compares this against its own version
+    /// to detect a stale daemon and offer a transparent restart. Optional
+    /// for forwards compatibility with daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

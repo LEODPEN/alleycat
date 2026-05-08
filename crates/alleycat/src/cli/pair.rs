@@ -15,6 +15,7 @@ pub struct PairArgs {
 }
 
 pub async fn run(args: PairArgs) -> anyhow::Result<()> {
+    cli::ensure_current_daemon().await?;
     let payload: PairPayload = if ipc::is_daemon_running().await {
         let resp = cli::send(Request::Pair).await?;
         cli::decode_data(resp)?

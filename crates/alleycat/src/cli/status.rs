@@ -32,6 +32,10 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
 
     println!("{} daemon", crate::binary_name());
     println!("  pid:               {}", info.pid);
+    println!(
+        "  version:           {}",
+        info.version.as_deref().unwrap_or("<unknown>")
+    );
     println!("  node id:           {}", info.node_id);
     println!("  token (sha256/16): {}", info.token_short);
     println!(
@@ -75,5 +79,6 @@ async fn offline_status() -> anyhow::Result<StatusInfo> {
             .unwrap_or_else(|_| "<unknown>".to_string()),
         uptime_secs: 0,
         agents: agent_list,
+        version: Some(crate::binary_version().to_string()),
     })
 }

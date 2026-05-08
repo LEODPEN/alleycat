@@ -3,6 +3,7 @@ use crate::daemon::control::{Request, RotateResult, token_fingerprint};
 use crate::ipc;
 
 pub async fn run() -> anyhow::Result<()> {
+    cli::ensure_current_daemon().await?;
     if ipc::is_daemon_running().await {
         let resp = cli::send(Request::Rotate).await?;
         let result: RotateResult = cli::decode_data(resp)?;

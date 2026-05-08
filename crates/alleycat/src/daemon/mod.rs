@@ -195,6 +195,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
             .unwrap_or_else(|_| "<unknown>".to_string()),
         uptime_secs: daemon.started_at.elapsed().as_secs(),
         agents: daemon.agents.list_agents().await,
+        version: Some(crate::binary_version().to_string()),
     };
     Response::ok_with(&info).unwrap_or_else(|e| Response::err(e.to_string()))
 }

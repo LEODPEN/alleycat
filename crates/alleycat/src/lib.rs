@@ -44,6 +44,11 @@ pub struct App {
     /// Reverse-DNS label used as the launchd Label, the plist filename
     /// stem, and `service::service_label()` (e.g. `com.sigkitten.kittylitter`).
     pub label: &'static str,
+    /// SemVer of the *binary* (the wrapper crate, e.g. `kittylitter` 0.2.1),
+    /// not of this library. Reported by the daemon over IPC so a freshly
+    /// installed CLI can detect a stale long-running daemon and respawn
+    /// itself transparently. Binaries should pass `env!("CARGO_PKG_VERSION")`.
+    pub version: &'static str,
 }
 
 impl App {
@@ -56,6 +61,7 @@ impl App {
         organization: "Alleycat",
         application: "alleycat",
         label: "dev.alleycat.alleycat",
+        version: env!("CARGO_PKG_VERSION"),
     };
 
     /// Build a tokio runtime, parse CLI args using `self.binary_name` as
@@ -81,6 +87,13 @@ pub(crate) fn app() -> &'static App {
 /// in shipped builds, `alleycat` in dev).
 pub fn binary_name() -> &'static str {
     app().binary_name
+}
+
+/// SemVer string of the binary that registered this `App`. Used by the
+/// daemon to advertise its own version and by the CLI to compare against
+/// it before mutating user-visible state.
+pub fn binary_version() -> &'static str {
+    app().version
 }
 
 #[derive(Parser)]
@@ -118,6 +131,10 @@ enum Command {
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
     /// methods directly. Defaults to invoking `thread/list` on the chosen agent.
     Probe(cli::probe::ProbeArgs),
+    /// Restart any running daemon onto the version of *this* binary. Designed
+    /// for `npx <wrapper>@latest upgrade` — npm fetches the new tarball, then
+    /// this subcommand bounces a stale daemon onto it.
+    Upgrade,
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -172,6 +189,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Probe(args)) => {
             init_cli_logging();
             cli::probe::run(args).await
+        }
+        Some(Command::Upgrade) => {
+            init_cli_logging();
+            cli::upgrade::run().await
         }
     }
 }

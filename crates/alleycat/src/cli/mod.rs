@@ -2,9 +2,11 @@
 //! control socket. Each subcommand opens a fresh connection, writes a single
 //! length-prefixed JSON request, reads a single response, and exits.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, anyhow};
 
-use crate::daemon::control::{Request, Response};
+use crate::daemon::control::{Request, Response, StatusInfo};
 use crate::framing::{read_json_frame, write_json_frame};
 use crate::ipc;
 
@@ -17,6 +19,7 @@ pub mod reload;
 pub mod rotate;
 pub mod status;
 pub mod stop;
+pub mod upgrade;
 
 /// Send a single request to the daemon and read back the response.
 /// Errors with a friendly hint if the daemon is not running.
@@ -54,4 +57,109 @@ pub fn require_ok(resp: &Response) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// If a daemon is running on a *different* binary version than this CLI,
+/// gracefully stop it and respawn `current_exe serve` as a detached child.
+/// No-op when the daemon isn't running, when versions match, or when we
+/// can't tell (older daemon that doesn't advertise `version`).
+///
+/// Called at the top of subcommands that mutate user-visible state (`pair`,
+/// `rotate`) so a freshly-installed CLI never silently talks to a stale
+/// daemon and produces stale output (e.g. a pair QR missing the relay URL).
+pub async fn ensure_current_daemon() -> anyhow::Result<()> {
+    if !ipc::is_daemon_running().await {
+        return Ok(());
+    }
+    let Ok(resp) = send(Request::Status).await else {
+        return Ok(());
+    };
+    let Ok(status) = decode_data::<StatusInfo>(resp) else {
+        return Ok(());
+    };
+    let cli_version = crate::binary_version();
+    let daemon_version = match status.version.as_deref() {
+        Some(v) => v,
+        // Pre-`version` daemons can't tell us — assume mismatch and offer
+        // to bounce, since the only way the user invoked this code path is
+        // by running a newer CLI.
+        None => "<unknown>",
+    };
+    if daemon_version == cli_version {
+        return Ok(());
+    }
+    eprintln!(
+        "note: daemon is v{daemon_version} but {cli} is v{cli_version}; restarting daemon onto v{cli_version}...",
+        cli = crate::binary_name()
+    );
+    restart_daemon().await
+}
+
+/// Stop any running daemon and start a fresh one from `current_exe`.
+/// Public so the explicit `upgrade` subcommand can reuse the same path.
+pub async fn restart_daemon() -> anyhow::Result<()> {
+    if ipc::is_daemon_running().await {
+        let _ = send(Request::Stop).await;
+        wait_until(Duration::from_secs(10), || async {
+            !ipc::is_daemon_running().await
+        })
+        .await
+        .context("old daemon did not exit within 10s")?;
+    }
+    spawn_serve_detached().context("spawning new daemon")?;
+    wait_until(Duration::from_secs(15), || async {
+        ipc::is_daemon_running().await
+    })
+    .await
+    .context("new daemon did not come up within 15s")?;
+    Ok(())
+}
+
+/// Spawn `current_exe serve` as a session-detached background process so
+/// it survives the parent CLI exit and any controlling-terminal SIGHUP.
+fn spawn_serve_detached() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach from the controlling terminal: setsid() makes the child a
+        // new session leader so a closing terminal can't SIGHUP it.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn().context("spawning daemon child")?;
+    Ok(())
+}
+
+/// Poll `cond` every 100ms until it returns true or `deadline` elapses.
+/// Returns `Ok(())` on success, `Err` with a context-friendly message
+/// once the deadline trips.
+async fn wait_until<F, Fut>(deadline: Duration, mut cond: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = Instant::now();
+    loop {
+        if cond().await {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(anyhow!("timed out waiting for daemon state"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
