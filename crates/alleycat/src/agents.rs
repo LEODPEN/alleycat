@@ -97,8 +97,10 @@ impl AgentManager {
                 .with_context(|| format!("creating {}", home.display()))?;
         }
 
+        let pi_bin = resolve_pi_bin(&snapshot.agents.pi.bin)
+            .unwrap_or_else(|| snapshot.agents.pi.bin.clone());
         let mut pi_builder = PiBridge::builder()
-            .agent_bin(snapshot.agents.pi.bin.clone())
+            .agent_bin(pi_bin)
             .launcher(Arc::new(LocalLauncher));
         if let Some(ref home) = codex_home {
             pi_builder = pi_builder.codex_home(home.clone());
@@ -446,7 +448,7 @@ impl AgentManager {
 
     fn pi_available(&self) -> bool {
         let cfg = self.config.load();
-        cfg.agents.pi.enabled && which::which(&cfg.agents.pi.bin).is_ok()
+        cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin).is_some()
     }
 
     fn opencode_available(&self) -> bool {
@@ -567,6 +569,23 @@ fn program_candidates(program: &Path) -> Vec<PathBuf> {
     which::which(program)
         .map(|path| vec![path])
         .unwrap_or_default()
+}
+
+/// Resolve the configured pi binary against PATH. If the configured name
+/// isn't on PATH, fall back to known aliases (`pi`, `pi-coding-agent`) so
+/// users with stale config or non-canonical install layouts still get the
+/// agent reported as available and spawn against a binary that actually
+/// exists. Returns the resolved name (the one that should be invoked).
+fn resolve_pi_bin(configured: &str) -> Option<String> {
+    if which::which(configured).is_ok() {
+        return Some(configured.to_string());
+    }
+    for alias in ["pi", "pi-coding-agent"] {
+        if alias != configured && which::which(alias).is_ok() {
+            return Some(alias.to_string());
+        }
+    }
+    None
 }
 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {

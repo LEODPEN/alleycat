@@ -1056,7 +1056,10 @@ fn binding_to_thread(binding: &OpencodeBinding) -> Value {
         "modelProvider": "opencode",
         "createdAt": binding.created_at,
         "updatedAt": binding.updated_at,
-        "status": "notLoaded",
+        // Codex `ThreadStatus` is a serde-tagged enum (`tag = "type"`).
+        // A bare string here makes the connected client reject the
+        // entire response. Mirror the events.rs projection.
+        "status": {"type": "notLoaded"},
         "path": null,
         "cwd": binding.directory,
         "cliVersion": concat!("alleycat-opencode-bridge/", env!("CARGO_PKG_VERSION")),
@@ -1371,5 +1374,30 @@ fn cursor_after_binding(
         std::cmp::Ordering::Equal => {
             binding.thread_id.cmp(&cursor.id) == std::cmp::Ordering::Greater
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_binding() -> OpencodeBinding {
+        OpencodeBinding {
+            thread_id: "thread".to_string(),
+            session_id: "session".to_string(),
+            directory: "/tmp".to_string(),
+            workspace_id: None,
+            archived: false,
+            name: Some("Greeting".to_string()),
+            created_at: 0,
+            updated_at: 0,
+            preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn binding_to_thread_emits_tagged_status() {
+        let projected = binding_to_thread(&sample_binding());
+        assert_eq!(projected["status"], json!({"type": "notLoaded"}));
     }
 }
