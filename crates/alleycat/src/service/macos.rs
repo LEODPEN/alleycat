@@ -18,47 +18,82 @@ pub(super) fn install() -> anyhow::Result<()> {
     write_plist(&plist_path, &exe, &log_path, inherit_path.as_deref())?;
 
     let uid = current_uid();
+    let domain_target = format!("gui/{uid}/{label}", label = service_label());
+    let plist_str = plist_path
+        .to_str()
+        .ok_or_else(|| anyhow!("plist path is not valid UTF-8"))?;
+
     let _ = Command::new("launchctl")
-        .args([
-            "bootout",
-            &format!("gui/{uid}/{label}", label = service_label()),
-        ])
+        .args(["bootout", &domain_target])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 
-    let bootstrap = Command::new("launchctl")
-        .args([
-            "bootstrap",
-            &format!("gui/{uid}"),
-            plist_path
-                .to_str()
-                .ok_or_else(|| anyhow!("plist path is not valid UTF-8"))?,
-        ])
-        .status()
-        .context("running launchctl bootstrap")?;
-    if !bootstrap.success() {
-        return Err(anyhow!(
-            "launchctl bootstrap failed (exit {:?})",
-            bootstrap.code()
-        ));
+    // launchd retains in-memory state for a recently-unloaded service for a
+    // brief window after `bootout`. Bootstrapping the same label too quickly
+    // returns "Bootstrap failed: 5: Input/output error". Poll `launchctl
+    // print` until the service is gone before bootstrapping.
+    wait_until_unloaded(&domain_target, std::time::Duration::from_secs(5));
+
+    // Try bootstrap up to 3 times, sleeping briefly on EIO. The race window
+    // is usually <1s but launchd state can be flaky on macOS Sequoia.
+    let mut last_status: Option<std::process::ExitStatus> = None;
+    for attempt in 0..3 {
+        let bootstrap = Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}"), plist_str])
+            .status()
+            .context("running launchctl bootstrap")?;
+        if bootstrap.success() {
+            last_status = Some(bootstrap);
+            break;
+        }
+        last_status = Some(bootstrap);
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)));
+            // Re-poll: the previous bootstrap may have left half-state.
+            wait_until_unloaded(&domain_target, std::time::Duration::from_secs(2));
+        }
+    }
+    match last_status {
+        Some(s) if s.success() => {}
+        Some(s) => {
+            return Err(anyhow!(
+                "launchctl bootstrap failed after retries (exit {:?})",
+                s.code()
+            ));
+        }
+        None => unreachable!("loop guarantees at least one attempt"),
     }
 
     let _ = Command::new("launchctl")
-        .args([
-            "enable",
-            &format!("gui/{uid}/{label}", label = service_label()),
-        ])
+        .args(["enable", &domain_target])
         .status();
 
     let _ = Command::new("launchctl")
-        .args([
-            "kickstart",
-            &format!("gui/{uid}/{label}", label = service_label()),
-        ])
+        .args(["kickstart", &domain_target])
         .status();
 
     Ok(())
+}
+
+/// Block until `launchctl print <target>` reports the service is gone, or
+/// `deadline` elapses. launchd returns non-zero when the target doesn't
+/// exist, so a non-zero status means the prior bootout has settled.
+fn wait_until_unloaded(domain_target: &str, deadline: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        let still_loaded = Command::new("launchctl")
+            .args(["print", domain_target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !still_loaded {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub(super) fn uninstall() -> anyhow::Result<()> {

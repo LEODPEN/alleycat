@@ -175,7 +175,7 @@ enum PostResponse {
 async fn dispatch(daemon: Arc<DaemonState>, request: Request) -> (Response, Option<PostResponse>) {
     match request {
         Request::Status => (handle_status(&daemon).await, None),
-        Request::Pair => (handle_pair(&daemon), None),
+        Request::Pair => (handle_pair(&daemon).await, None),
         Request::Rotate => (handle_rotate(&daemon).await, None),
         Request::Reload => (handle_reload(&daemon).await, None),
         Request::AgentsList => (handle_agents_list(&daemon).await, None),
@@ -200,13 +200,15 @@ async fn handle_status(daemon: &DaemonState) -> Response {
     Response::ok_with(&info).unwrap_or_else(|e| Response::err(e.to_string()))
 }
 
-fn handle_pair(daemon: &DaemonState) -> Response {
+async fn handle_pair(daemon: &DaemonState) -> Response {
+    wait_for_relay(&daemon.endpoint).await;
     let cfg = daemon.config.load();
     let payload = host::pair_payload(&daemon.secret_key, &cfg, Some(&daemon.endpoint));
     Response::ok_with(&payload).unwrap_or_else(|e| Response::err(e.to_string()))
 }
 
 async fn handle_rotate(daemon: &DaemonState) -> Response {
+    wait_for_relay(&daemon.endpoint).await;
     let new_cfg = match crate::config::rotate_token().await {
         Ok(c) => c,
         Err(error) => return Response::err(format!("rotate failed: {error:#}")),
@@ -219,6 +221,17 @@ async fn handle_rotate(daemon: &DaemonState) -> Response {
         payload,
     })
     .unwrap_or_else(|e| Response::err(e.to_string()))
+}
+
+/// Best-effort wait for the iroh endpoint to bind a home relay before
+/// serializing a pair payload. Without this, a freshly-spawned daemon will
+/// happily emit a QR with `relay: null` because the relay-probe task hasn't
+/// completed yet — and on networks where pkarr/DNS publishing is broken
+/// (Tailscale, IPv6-only relays), that QR is undialable. 8s matches the
+/// existing online-probe timeout in `host::bind_endpoint`. If the network
+/// truly has no relay path, we fall through and emit whatever we have.
+async fn wait_for_relay(endpoint: &iroh::Endpoint) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), endpoint.online()).await;
 }
 
 async fn handle_reload(daemon: &DaemonState) -> Response {
