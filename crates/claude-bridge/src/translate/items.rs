@@ -96,6 +96,38 @@ pub fn list_user_message_ids_from_text(text: &str) -> Vec<String> {
     out
 }
 
+/// Walk the on-disk transcript and return the most recent assistant
+/// `message.model` value (e.g. `"claude-opus-4-7"`). Used as a fallback when
+/// answering `thread/resume` / `thread/fork` against a thread the bridge
+/// process hasn't run yet — claude only emits `system/init` (which carries
+/// the live model) once the first user message arrives on stdin, so without
+/// this fallback the response model would be empty until the user types
+/// anything. Returns `None` for transcripts with no assistant records.
+pub async fn last_assistant_model(path: &Path) -> Result<Option<String>> {
+    let text = match fs::read_to_string(path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(last_assistant_model_from_text(&text))
+}
+
+/// Variant for transports that already fetched the transcript text (remote
+/// launcher path).
+pub fn last_assistant_model_from_text(text: &str) -> Option<String> {
+    parse_jsonl(text).into_iter().rev().find_map(|record| {
+        if record.record_type != "assistant" {
+            return None;
+        }
+        record
+            .message
+            .as_ref()?
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 /// Stable test seam. `messages_to_turns` calls this after reading.
 pub fn parse_jsonl(text: &str) -> Vec<OnDiskRecord> {
     let mut out = Vec::new();
@@ -206,6 +238,7 @@ impl TurnBuilder {
         self.turns.push(Turn {
             id: format!("turn_{}", self.turns.len()),
             items: std::mem::take(&mut self.current_items),
+            items_view: alleycat_codex_proto::default_items_view(),
             status: TurnStatus::Completed,
             error: None,
             started_at: self.current_started_at.take(),
@@ -943,6 +976,50 @@ mod tests {
 
     fn record(value: Value) -> OnDiskRecord {
         serde_json::from_value(value).expect("parse")
+    }
+
+    #[test]
+    fn last_assistant_model_picks_most_recent_assistant_record() {
+        let text = [
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": "hi"},
+                "uuid": "u1"
+            }),
+            json!({
+                "type": "assistant",
+                "message": {"id": "m1", "model": "claude-sonnet-4-6", "content": []}
+            }),
+            json!({
+                "type": "user",
+                "message": {"role": "user", "content": "again"},
+                "uuid": "u2"
+            }),
+            json!({
+                "type": "assistant",
+                "message": {"id": "m2", "model": "claude-opus-4-7", "content": []}
+            }),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert_eq!(
+            last_assistant_model_from_text(&text).as_deref(),
+            Some("claude-opus-4-7"),
+        );
+    }
+
+    #[test]
+    fn last_assistant_model_returns_none_when_no_assistant_records() {
+        let text = json!({
+            "type": "user",
+            "message": {"role": "user", "content": "hi"},
+            "uuid": "u1"
+        })
+        .to_string();
+        assert!(last_assistant_model_from_text(&text).is_none());
     }
 
     #[test]

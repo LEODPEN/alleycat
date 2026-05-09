@@ -280,6 +280,7 @@ pub fn entry_from_pi(info: &PiSessionInfo) -> IndexEntry {
 pub fn thread_from_entry(entry: &IndexEntry) -> Thread {
     Thread {
         id: entry.thread_id.clone(),
+        session_id: entry.metadata.pi_session_id.clone(),
         forked_from_id: entry.forked_from_id.clone(),
         preview: entry.preview.clone(),
         ephemeral: false,
@@ -303,9 +304,10 @@ pub fn thread_from_entry(entry: &IndexEntry) -> Thread {
             ThreadSourceKind::AppServer => SessionSource::AppServer,
             _ => SessionSource::AppServer,
         },
+        thread_source: None,
         agent_nickname: None,
         agent_role: None,
-        git_info: None,
+        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
         name: entry.name.clone(),
         turns: Vec::new(),
     }

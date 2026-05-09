@@ -70,6 +70,7 @@ pub fn entry_from_claude(info: &ClaudeSessionInfo) -> IndexEntry {
 pub fn entry_to_thread(entry: &IndexEntry) -> Thread {
     Thread {
         id: entry.thread_id.clone(),
+        session_id: entry.metadata.claude_session_id.clone(),
         forked_from_id: entry.forked_from_id.clone(),
         preview: entry.preview.clone(),
         ephemeral: false,
@@ -87,9 +88,10 @@ pub fn entry_to_thread(entry: &IndexEntry) -> Thread {
         cwd: entry.cwd.clone(),
         cli_version: CLI_VERSION.to_string(),
         source: source_kind_to_session_source(entry.source),
+        thread_source: None,
         agent_nickname: None,
         agent_role: None,
-        git_info: None,
+        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
         name: entry.name.clone(),
         turns: Vec::new(),
     }

@@ -350,6 +350,7 @@ impl ConnectionState {
                 Turn {
                     id: t.turn_id.clone(),
                     items: t.items.clone(),
+                    items_view: alleycat_codex_proto::default_items_view(),
                     status: t.status,
                     error: t.error.clone(),
                     started_at: Some(started_at),

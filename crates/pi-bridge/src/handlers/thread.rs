@@ -210,6 +210,7 @@ pub async fn handle_thread_start(
             .permission_profile
             .clone()
             .or_else(|| Some(default_permission_profile())),
+        active_permission_profile: None,
         reasoning_effort,
     })
 }
@@ -305,6 +306,7 @@ pub async fn handle_thread_resume(
             .permission_profile
             .clone()
             .or_else(|| Some(default_permission_profile())),
+        active_permission_profile: None,
         reasoning_effort: params
             .additional
             .get("effort")
@@ -412,6 +414,7 @@ pub async fn handle_thread_fork(
             .unwrap_or(p::ApprovalsReviewer::User),
         sandbox: sandbox_value(params.sandbox.or(defaults.sandbox)),
         permission_profile: params.permission_profile.clone(),
+        active_permission_profile: None,
         reasoning_effort: params.additional.get("effort").and_then(parse_effort),
     })
 }
@@ -910,6 +913,7 @@ fn now_unix_millis() -> i64 {
 fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
     p::Thread {
         id: entry.thread_id.clone(),
+        session_id: entry.metadata.pi_session_id.clone(),
         forked_from_id: entry.forked_from_id.clone(),
         preview: entry.preview.clone(),
         ephemeral: false,
@@ -927,9 +931,10 @@ fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
         cwd: entry.cwd.clone(),
         cli_version: format!("alleycat-pi-bridge/{}", env!("CARGO_PKG_VERSION")),
         source: source_kind_to_session_source(entry.source),
+        thread_source: None,
         agent_nickname: None,
         agent_role: None,
-        git_info: None,
+        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
         name: entry.name.clone(),
         turns: Vec::new(),
     }

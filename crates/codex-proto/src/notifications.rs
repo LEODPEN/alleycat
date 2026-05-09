@@ -41,6 +41,8 @@ pub enum ServerNotification {
     SkillsChanged(SkillsChangedNotification),
     #[serde(rename = "thread/name/updated")]
     ThreadNameUpdated(ThreadNameUpdatedNotification),
+    #[serde(rename = "thread/goal/cleared")]
+    ThreadGoalCleared(ThreadIdOnly),
     #[serde(rename = "thread/tokenUsage/updated")]
     ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedNotification),
     #[serde(rename = "turn/started")]
@@ -77,6 +79,8 @@ pub enum ServerNotification {
     McpServerStatusUpdated(McpServerStatusUpdatedNotification),
     #[serde(rename = "account/rateLimits/updated")]
     AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification),
+    #[serde(rename = "remoteControl/status/changed")]
+    RemoteControlStatusChanged(RemoteControlStatusChangedNotification),
     #[serde(rename = "item/dynamicToolCall/argumentsDelta")]
     DynamicToolCallArgumentsDelta(DynamicToolCallArgumentsDeltaNotification),
     #[serde(rename = "thread/compacted")]
@@ -133,6 +137,23 @@ pub struct ThreadNameUpdatedNotification {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteControlConnectionStatus {
+    Disabled,
+    Connecting,
+    Connected,
+    Errored,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteControlStatusChangedNotification {
+    pub status: RemoteControlConnectionStatus,
+    #[serde(default)]
+    pub environment_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

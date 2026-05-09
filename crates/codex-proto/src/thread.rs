@@ -19,6 +19,7 @@ use super::items::ThreadItem;
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
+    pub session_id: String,
     #[serde(default)]
     pub forked_from_id: Option<String>,
     pub preview: String,
@@ -34,6 +35,8 @@ pub struct Thread {
     pub cwd: String,
     pub cli_version: String,
     pub source: SessionSource,
+    #[serde(default)]
+    pub thread_source: Option<Value>,
     #[serde(default)]
     pub agent_nickname: Option<String>,
     #[serde(default)]
@@ -54,6 +57,8 @@ pub struct Turn {
     /// Populated only on resume / fork responses (and replay reads).
     #[serde(default)]
     pub items: Vec<ThreadItem>,
+    #[serde(default = "default_items_view")]
+    pub items_view: String,
     pub status: TurnStatus,
     #[serde(default)]
     pub error: Option<TurnError>,
@@ -63,6 +68,10 @@ pub struct Turn {
     pub completed_at: Option<i64>,
     #[serde(default)]
     pub duration_ms: Option<i64>,
+}
+
+pub fn default_items_view() -> String {
+    "full".to_string()
 }
 
 // === thread/start ==========================================================
@@ -120,6 +129,8 @@ pub struct ThreadStartResponse {
     pub sandbox: SandboxPolicy,
     #[serde(default)]
     pub permission_profile: Option<PermissionProfile>,
+    #[serde(default)]
+    pub active_permission_profile: Option<PermissionProfile>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -180,6 +191,8 @@ pub struct ThreadResumeResponse {
     pub sandbox: SandboxPolicy,
     #[serde(default)]
     pub permission_profile: Option<PermissionProfile>,
+    #[serde(default)]
+    pub active_permission_profile: Option<PermissionProfile>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
 }

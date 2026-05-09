@@ -161,6 +161,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "alleycat-claude-remote-control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures",
+ "hostname",
+ "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "alleycat-codex-proto"
 version = "0.1.0"
 dependencies = [

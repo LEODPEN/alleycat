@@ -27,8 +27,8 @@ use crate::pool::claude_protocol::ControlRequestBody;
 use crate::pool::process::ClaudeProcessError;
 use crate::state::ConnectionState;
 use crate::translate::items::{
-    list_user_message_ids, list_user_message_ids_from_text, messages_text_to_turns,
-    messages_to_turns,
+    last_assistant_model, last_assistant_model_from_text, list_user_message_ids,
+    list_user_message_ids_from_text, messages_text_to_turns, messages_to_turns,
 };
 
 #[derive(Debug, Error)]
@@ -164,6 +164,7 @@ pub async fn handle_thread_start(
             .permission_profile
             .clone()
             .or_else(|| Some(default_permission_profile())),
+        active_permission_profile: None,
         reasoning_effort,
     })
 }
@@ -209,10 +210,19 @@ pub async fn handle_thread_resume(
         };
     }
 
-    let response_model = model
-        .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
-        .map(|model| normalize_claude_model_id(&model))
-        .unwrap_or_default();
+    let response_model = match model {
+        Some(m) => normalize_claude_model_id(&m),
+        None => {
+            // Prefer this thread's transcript (specific) over the connection-
+            // wide `last_init` cache (whichever thread last ran a turn).
+            let from_transcript =
+                transcript_model(state, &entry.metadata.claude_session_path).await;
+            from_transcript
+                .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
+                .map(|m| normalize_claude_model_id(&m))
+                .unwrap_or_default()
+        }
+    };
     let model_provider = params
         .model_provider
         .clone()
@@ -242,6 +252,7 @@ pub async fn handle_thread_resume(
             .permission_profile
             .clone()
             .or_else(|| Some(default_permission_profile())),
+        active_permission_profile: None,
         reasoning_effort: effort_from_params(&params.additional)
             .or(defaults.reasoning_effort)
             .or(Some(p::ReasoningEffort::High)),
@@ -321,10 +332,17 @@ pub async fn handle_thread_fork(
         thread.turns = transcript_turns(state, &entry.metadata.claude_session_path).await?;
     }
 
-    let response_model = model
-        .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
-        .map(|model| normalize_claude_model_id(&model))
-        .unwrap_or_default();
+    let response_model = match model {
+        Some(m) => normalize_claude_model_id(&m),
+        None => {
+            let from_transcript =
+                transcript_model(state, &entry.metadata.claude_session_path).await;
+            from_transcript
+                .or_else(|| state.caches().last_init.as_ref().map(|i| i.model.clone()))
+                .map(|m| normalize_claude_model_id(&m))
+                .unwrap_or_default()
+        }
+    };
     Ok(p::ThreadForkResponse {
         thread,
         model: response_model,
@@ -349,6 +367,7 @@ pub async fn handle_thread_fork(
             .permission_profile
             .clone()
             .or_else(|| Some(default_permission_profile())),
+        active_permission_profile: None,
         reasoning_effort: effort_from_params(&params.additional)
             .or(defaults.reasoning_effort)
             .or(Some(p::ReasoningEffort::High)),
@@ -766,6 +785,17 @@ async fn transcript_user_message_ids(
     list_user_message_ids(path)
         .await
         .map_err(|e| ThreadError::ClaudeRpc(format!("reading transcript: {e:#}")))
+}
+
+/// Best-effort scan of a thread's on-disk transcript for the most recent
+/// assistant `model`. Errors and missing files become `None` — this is only
+/// used to seed a response field, never to gate the request.
+async fn transcript_model(state: &Arc<ConnectionState>, path: &Path) -> Option<String> {
+    if state.trust_persisted_cwd() {
+        let text = read_transcript_via_launcher(state, path).await.ok()?;
+        return last_assistant_model_from_text(&text);
+    }
+    last_assistant_model(path).await.ok().flatten()
 }
 
 async fn read_transcript_via_launcher(

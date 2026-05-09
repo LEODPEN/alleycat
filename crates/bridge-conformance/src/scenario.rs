@@ -48,6 +48,11 @@ pub struct ScenarioConfig {
     pub client_name: String,
     /// Client-info version advertised on `initialize`.
     pub client_version: String,
+    /// Whether the scenario should reuse the per-target cached conformance
+    /// thread id. Aggregate shape diffs disable this so every target executes
+    /// the same attach method (`thread/start`) instead of comparing a cached
+    /// `thread/resume` on one implementation with a fresh start on another.
+    pub reuse_thread_cache: bool,
 }
 
 impl ScenarioConfig {
@@ -62,6 +67,7 @@ impl ScenarioConfig {
             // marker token is unique each time.
             client_name: format!("alleycat-bridge-conformance/{}", target.label()),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            reuse_thread_cache: true,
         }
     }
 }
@@ -150,7 +156,10 @@ pub async fn run(
     let listed = client
         .request(
             "thread/list",
-            json!({ "archived": false }),
+            json!({
+                "archived": false,
+                "cwd": cfg.cwd.to_string_lossy(),
+            }),
             cfg.default_deadline,
         )
         .await
@@ -180,7 +189,11 @@ pub async fn run(
     // Label the captured frame with the method we actually call, so the
     // diff layer compares "codex thread/resume" to "bridge thread/resume"
     // (not to "bridge thread/start", which would mismatch shapes).
-    let cached_id = cache::load_thread_id(target);
+    let cached_id = if cfg.reuse_thread_cache {
+        cache::load_thread_id(target)
+    } else {
+        None
+    };
     let (resumed_id, attach_method, attach_response) = if let Some(id) = cached_id.clone() {
         let resume_params = json!({
             "threadId": id,
@@ -247,7 +260,7 @@ pub async fn run(
             return Ok(t);
         }
     };
-    if cached_id.as_deref() != Some(thread_id.as_str()) {
+    if cfg.reuse_thread_cache && cached_id.as_deref() != Some(thread_id.as_str()) {
         if let Err(err) = cache::save_thread_id(target, &thread_id) {
             tracing::warn!(?err, "failed to persist conformance thread id");
         }

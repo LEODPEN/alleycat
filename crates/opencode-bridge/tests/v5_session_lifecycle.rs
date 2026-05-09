@@ -127,17 +127,14 @@ async fn bring_up_bridge() -> (
     let sse_injector: SseInjector = Arc::new(Mutex::new(None));
     let base_url = start_fake_opencode(Arc::clone(&seen), Arc::clone(&sse_injector));
     let state_dir = tempfile::TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("ALLEYCAT_BRIDGE_STATE_DIR", state_dir.path());
-    }
     let bridge = Arc::new(
-        OpencodeBridge::new(OpencodeRuntime::external(base_url, "test-token".into()))
-            .await
-            .unwrap(),
+        OpencodeBridge::new_with_state_dir(
+            OpencodeRuntime::external(base_url, "test-token".into()),
+            state_dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap(),
     );
-    unsafe {
-        std::env::remove_var("ALLEYCAT_BRIDGE_STATE_DIR");
-    }
     let (client, server) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(serve_stream(bridge, server));
     let (read, mut write) = tokio::io::split(client);

@@ -6,6 +6,7 @@ use crate::index::ThreadIndex;
 use crate::opencode_client::OpencodeClient;
 use crate::pty::PtyState;
 use crate::state::{BridgeState, PartKind, TokenUsageBreakdown};
+use crate::translate::parts::message_to_turn_items_with_context;
 use crate::translate::tool::{
     ToolPartContext, tool_part_side_notifications, tool_part_status_is_terminal,
     tool_part_to_item_with_context,
@@ -90,6 +91,7 @@ pub async fn route_event(rc: RouteContext<'_>, event: Value) {
         }
         "session.idle" => {
             if let Some(active) = rc.state.take_active_turn(&thread_id) {
+                emit_idle_message_fallback(rc, &thread_id, &active.turn_id, &active).await;
                 let completed_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -102,7 +104,9 @@ pub async fn route_event(rc: RouteContext<'_>, event: Value) {
                         "turn": {
                             "id": turn_id,
                             "items": [],
+                            "itemsView": "full",
                             "status": "completed",
+                            "error": null,
                             "startedAt": active.started_at,
                             "completedAt": completed_at,
                             "durationMs": duration_ms,
@@ -139,10 +143,7 @@ pub async fn route_event(rc: RouteContext<'_>, event: Value) {
             );
         }
         "session.error" => {
-            let error = props
-                .get("error")
-                .cloned()
-                .unwrap_or(json!({"message":"opencode error"}));
+            let error = normalize_turn_error(props.get("error").unwrap_or(&Value::Null));
             let _ = rc.conn.notifier().send_notification(
                 "error",
                 json!({"threadId":thread_id,"turnId":turn_id,"error":error,"willRetry":false}),
@@ -465,11 +466,111 @@ fn handle_message_updated(rc: RouteContext<'_>, props: &Value, thread_id: &str, 
                 },
             }),
         );
+        rc.state.mark_message_completed(message_id);
         rc.state.update_active_turn(thread_id, |turn| {
             if turn.current_assistant_message_id.as_deref() == Some(message_id) {
                 turn.current_assistant_message_id = None;
             }
         });
+    }
+}
+
+async fn emit_idle_message_fallback(
+    rc: RouteContext<'_>,
+    thread_id: &str,
+    turn_id: &str,
+    active: &crate::state::ActiveTurn,
+) {
+    let Some(session_id) = active.session_id.as_deref() else {
+        return;
+    };
+    let Ok(messages) = rc
+        .client
+        .get(&format!("/session/{session_id}/message"))
+        .await
+    else {
+        return;
+    };
+    let Some(messages) = messages.as_array() else {
+        return;
+    };
+    let Some(message) = messages.iter().rev().find(|message| {
+        message
+            .pointer("/info/role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "assistant")
+            && message
+                .pointer("/info/time/completed")
+                .and_then(Value::as_i64)
+                .is_some()
+    }) else {
+        return;
+    };
+    let Some(message_id) = message.pointer("/info/id").and_then(Value::as_str) else {
+        return;
+    };
+    if rc.state.message_completed(message_id) {
+        return;
+    }
+    let binding_cwd = rc
+        .index
+        .by_thread(thread_id)
+        .map(|binding| binding.directory);
+    let tool_context = ToolPartContext {
+        cwd: binding_cwd.as_deref(),
+        sender_thread_id: Some(thread_id),
+        include_side_channel_items: false,
+    };
+    for item in message_to_turn_items_with_context(message, tool_context) {
+        if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+            continue;
+        }
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(message_id)
+            .to_string();
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if rc.state.mark_message_started(&item_id) {
+            let _ = rc.conn.notifier().send_notification(
+                "item/started",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "agentMessage",
+                        "id": item_id,
+                        "text": "",
+                        "phase": "final_answer",
+                        "memoryCitation": null,
+                    },
+                }),
+            );
+        }
+        if !text.is_empty() {
+            let _ = rc.conn.notifier().send_notification(
+                "item/agentMessage/delta",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": item_id,
+                    "delta": text,
+                }),
+            );
+        }
+        let _ = rc.conn.notifier().send_notification(
+            "item/completed",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": item,
+            }),
+        );
+        rc.state.mark_message_completed(&item_id);
     }
 }
 
@@ -818,8 +919,12 @@ fn file_diffs_to_unified(diffs: &Value) -> String {
 /// pub crate-wide just for one call site).
 fn binding_to_thread(binding: &crate::index::OpencodeBinding) -> Value {
     let path = format!("opencode://session/{}", binding.session_id);
+    let git_info = alleycat_bridge_core::git_info_for_cwd(&binding.directory)
+        .and_then(|info| serde_json::to_value(info).ok())
+        .unwrap_or(Value::Null);
     json!({
         "id": binding.thread_id,
+        "sessionId": binding.session_id,
         "forkedFromId": null,
         "preview": binding.preview,
         "ephemeral": false,
@@ -834,10 +939,20 @@ fn binding_to_thread(binding: &crate::index::OpencodeBinding) -> Value {
         "cwd": binding.directory,
         "cliVersion": concat!("alleycat-opencode-bridge/", env!("CARGO_PKG_VERSION")),
         "source": "appServer",
-        "gitInfo": null,
+        "threadSource": null,
+        "gitInfo": git_info,
         "name": binding.name,
         "turns": []
     })
+}
+
+fn normalize_turn_error(raw: &Value) -> Value {
+    let message = raw
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| raw.pointer("/data/message").and_then(Value::as_str))
+        .unwrap_or("opencode error");
+    json!({ "message": message })
 }
 
 /// Handle SSE events that don't carry a session id — bridge-wide notices like

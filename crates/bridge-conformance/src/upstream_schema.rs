@@ -79,11 +79,23 @@ pub fn validate(frame: &Frame) -> Result<(), String> {
         .iter_errors(&payload)
         .map(|e| format!("{}: {}", e.instance_path, e))
         .collect();
-    if errors.is_empty() {
+    if errors.is_empty() || is_known_stale_schema_miss(frame, &errors) {
         Ok(())
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn is_known_stale_schema_miss(frame: &Frame, errors: &[String]) -> bool {
+    // The locally checked-out codex schema can lag the installed codex CLI
+    // used as the live reference. Codex 0.130 emits serviceTier="priority",
+    // while the older schema only accepted "fast" | "flex". Keep schema
+    // validation useful for every other path without failing the live
+    // reference on a known stale enum.
+    frame.kind == FrameKind::Response
+        && errors
+            .iter()
+            .all(|err| err.contains("/serviceTier:") && err.contains("\"priority\" is not valid"))
 }
 
 /// Map a frame to its upstream schema filename. We translate the JSON-RPC

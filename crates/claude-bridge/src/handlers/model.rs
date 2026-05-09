@@ -109,8 +109,17 @@ fn build_model(
         input_modalities: vec![json!("text"), json!("image")],
         supports_personality: false,
         additional_speed_tiers: Vec::new(),
+        service_tiers: standard_service_tiers(),
         is_default,
     }
+}
+
+fn standard_service_tiers() -> Vec<p::ModelServiceTier> {
+    vec![p::ModelServiceTier {
+        id: "standard".to_string(),
+        name: "Standard".to_string(),
+        description: "Default bridge service tier".to_string(),
+    }]
 }
 
 fn reasoning_options() -> Vec<p::ReasoningEffortOption> {

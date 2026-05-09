@@ -16,14 +16,11 @@ async fn initialize_thread_start_turn_start_smoke() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let base_url = start_fake_opencode(Arc::clone(&seen));
     let state_dir = tempfile::TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("ALLEYCAT_BRIDGE_STATE_DIR", state_dir.path());
-    }
     let bridge = Arc::new(
-        OpencodeBridge::new(OpencodeRuntime::external(
-            base_url,
-            "test-token".to_string(),
-        ))
+        OpencodeBridge::new_with_state_dir(
+            OpencodeRuntime::external(base_url, "test-token".to_string()),
+            state_dir.path().to_path_buf(),
+        )
         .await
         .unwrap(),
     );
@@ -81,9 +78,6 @@ async fn initialize_thread_start_turn_start_smoke() {
 
     drop(write);
     server_task.abort();
-    unsafe {
-        std::env::remove_var("ALLEYCAT_BRIDGE_STATE_DIR");
-    }
 }
 
 async fn send<W: tokio::io::AsyncWrite + Unpin>(

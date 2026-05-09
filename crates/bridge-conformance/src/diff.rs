@@ -114,6 +114,7 @@ impl KnownDivergence {
                     //opencode auto-generates a thread title from the model
                     // output; codex never names a thread on creation.
                     "thread.name",
+                    "serviceTier",
                     // Same CommandExecution shape divergence as thread/read
                     // (see comment there) — applies whenever a turn with a
                     // tool call is replayed back in a thread/start response.
@@ -124,6 +125,10 @@ impl KnownDivergence {
                     "thread.turns[].items[].aggregatedOutput",
                     "thread.turns[].items[].commandActions",
                     "thread.turns[].items[].commandActions[]",
+                    "thread.turns[].items[].commandActions[].command",
+                    "thread.turns[].items[].commandActions[].name",
+                    "thread.turns[].items[].commandActions[].path",
+                    "thread.turns[].items[].commandActions[].type",
                     "thread.turns[].items[].phase",
                     "thread.turns[].items[].summary",
                     "thread.turns[].items[].summary[]",
@@ -157,6 +162,10 @@ impl KnownDivergence {
                     "thread.turns[].items[].aggregatedOutput",
                     "thread.turns[].items[].commandActions",
                     "thread.turns[].items[].commandActions[]",
+                    "thread.turns[].items[].commandActions[].command",
+                    "thread.turns[].items[].commandActions[].name",
+                    "thread.turns[].items[].commandActions[].path",
+                    "thread.turns[].items[].commandActions[].type",
                     "thread.name",
                 ],
             ),
@@ -185,6 +194,10 @@ impl KnownDivergence {
                     "thread.turns[].items[].aggregatedOutput",
                     "thread.turns[].items[].commandActions",
                     "thread.turns[].items[].commandActions[]",
+                    "thread.turns[].items[].commandActions[].command",
+                    "thread.turns[].items[].commandActions[].name",
+                    "thread.turns[].items[].commandActions[].path",
+                    "thread.turns[].items[].commandActions[].type",
                 ],
             ),
             (
@@ -217,14 +230,12 @@ impl KnownDivergence {
             (
                 "thread/list",
                 &[
+                    // Thread titles are content, not shape. Codex and
+                    // opencode can auto-title threads; claude/pi may only
+                    // have an explicit name after `thread/name/set`.
+                    "data[].name",
                     "data[].agentNickname",
                     "data[].agentRole",
-                    // gitInfo is populated by codex (it shells out to
-                    // `git`); bridges don't extract repo metadata.
-                    "data[].gitInfo",
-                    "data[].gitInfo.branch",
-                    "data[].gitInfo.originUrl",
-                    "data[].gitInfo.sha",
                     // codex paginates at 25 entries; bridges return all
                     // matching threads in one page so the cursors are null
                     // (and `skip_serializing_if`-omitted from the wire).
@@ -239,6 +250,11 @@ impl KnownDivergence {
         const SHAPE_DIVERGENT_NOTIFICATIONS: &[&str] = &[
             "mcpServer/startupStatus/updated",
             "account/rateLimits/updated",
+            // Codex app-server emits these for its own host-side remote
+            // control / persisted-goal subsystems. The bridges do not own
+            // those Codex-local controllers.
+            "remoteControl/status/changed",
+            "thread/goal/cleared",
             // `tokenUsage` differs because bridges report their own
             // token counts which often lack `modelContextWindow`.
             "thread/tokenUsage/updated",

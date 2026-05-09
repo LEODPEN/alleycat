@@ -28,14 +28,11 @@ async fn turn_start_acks_immediately_then_session_idle_completes_turn() {
     let sse_injector: SseInjector = Arc::new(Mutex::new(None));
     let base_url = start_fake_opencode(Arc::clone(&seen), Arc::clone(&sse_injector));
     let state_dir = tempfile::TempDir::new().unwrap();
-    unsafe {
-        std::env::set_var("ALLEYCAT_BRIDGE_STATE_DIR", state_dir.path());
-    }
     let bridge = Arc::new(
-        OpencodeBridge::new(OpencodeRuntime::external(
-            base_url,
-            "test-token".to_string(),
-        ))
+        OpencodeBridge::new_with_state_dir(
+            OpencodeRuntime::external(base_url, "test-token".to_string()),
+            state_dir.path().to_path_buf(),
+        )
         .await
         .unwrap(),
     );
@@ -147,9 +144,6 @@ async fn turn_start_acks_immediately_then_session_idle_completes_turn() {
 
     drop(write);
     server_task.abort();
-    unsafe {
-        std::env::remove_var("ALLEYCAT_BRIDGE_STATE_DIR");
-    }
 }
 
 fn inject_sse(injector: &SseInjector, event: Value) {

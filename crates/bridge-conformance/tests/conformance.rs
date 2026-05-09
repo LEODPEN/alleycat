@@ -50,7 +50,7 @@ async fn conformance_opencode() {
 #[tokio::test]
 #[ignore = "live conformance — runs all four targets and diffs them"]
 async fn conformance_diff_all_against_codex() {
-    let codex_transcript = match drive(TargetId::Codex).await {
+    let codex_transcript = match drive_fresh(TargetId::Codex).await {
         DriveOutcome::Ran(t) => t,
         DriveOutcome::Skipped(reason) => {
             eprintln!("conformance_diff: codex skipped, no reference; aborting: {reason}");
@@ -67,7 +67,7 @@ async fn conformance_diff_all_against_codex() {
 
     let mut had_findings = false;
     for target in [TargetId::Pi, TargetId::Claude, TargetId::Opencode] {
-        match drive(target).await {
+        match drive_fresh(target).await {
             DriveOutcome::Ran(t) => {
                 eprintln!(
                     "conformance_diff: {target} captured {} frames",
@@ -127,12 +127,24 @@ async fn run_target(target: TargetId) {
 }
 
 async fn drive(target: TargetId) -> DriveOutcome {
+    drive_with_options(target, true, true).await
+}
+
+async fn drive_fresh(target: TargetId) -> DriveOutcome {
+    drive_with_options(target, false, false).await
+}
+
+async fn drive_with_options(
+    target: TargetId,
+    reuse_thread_cache: bool,
+    use_stable_cwd: bool,
+) -> DriveOutcome {
     let prereq = match prereq::check(target).await {
         Ok(p) => p,
         Err(SkipReason::Reason(s)) => return DriveOutcome::Skipped(s),
     };
 
-    let spawn_opts = match build_spawn(target, &prereq) {
+    let spawn_opts = match build_spawn(target, &prereq, use_stable_cwd) {
         Ok(s) => s,
         Err(err) => return DriveOutcome::Failed(err),
     };
@@ -141,7 +153,8 @@ async fn drive(target: TargetId) -> DriveOutcome {
         Ok(h) => h,
         Err(err) => return DriveOutcome::Failed(err),
     };
-    let cfg = scenario::ScenarioConfig::for_target(target, spawn_opts.cwd.clone());
+    let mut cfg = scenario::ScenarioConfig::for_target(target, spawn_opts.cwd.clone());
+    cfg.reuse_thread_cache = reuse_thread_cache;
     let transcript = match scenario::run(&mut handle.client, &cfg, target).await {
         Ok(t) => t,
         Err(err) => return DriveOutcome::Failed(err),
@@ -169,15 +182,23 @@ fn dump_transcript(
     Ok(())
 }
 
-fn build_spawn(target: TargetId, prereq: &Prereq) -> anyhow::Result<TargetSpawn> {
+fn build_spawn(
+    target: TargetId,
+    prereq: &Prereq,
+    use_stable_cwd: bool,
+) -> anyhow::Result<TargetSpawn> {
     // Stable cwd lives at ~/.cache/alleycat-bridge-conformance/cwd/. Reusing
     // it run-to-run lets us also reuse the per-target thread id (cwd is part
     // of every bridge's thread-id binding). On a machine without $HOME we
     // fall back to a tempdir, which means thread ids won't be reusable —
     // acceptable degradation.
-    let cwd = match cache::stable_cwd() {
-        Ok(p) => p,
-        Err(_) => tempfile::TempDir::new()?.keep(),
+    let cwd = if use_stable_cwd {
+        match cache::stable_cwd() {
+            Ok(p) => p,
+            Err(_) => tempfile::TempDir::new()?.keep(),
+        }
+    } else {
+        tempfile::TempDir::new()?.keep()
     };
     Ok(match (target, prereq) {
         (TargetId::Codex, Prereq::Codex { bin }) => TargetSpawn {

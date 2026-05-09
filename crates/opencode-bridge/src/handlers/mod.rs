@@ -137,9 +137,9 @@ impl OpencodeBridge {
             "approvalPolicy": params.get("approvalPolicy").cloned().unwrap_or(json!("untrusted")),
             "approvalsReviewer": params.get("approvalsReviewer").cloned().unwrap_or(json!("user")),
             // codex `SandboxPolicy` is tagged on `type` (e.g.
-            // `{type:"workspace-write"}`), not `mode`. See
+            // `{type:"workspaceWrite"}`), not `mode`. See
             // codex-rs/protocol/src/protocol.rs:SandboxPolicy.
-            "sandbox": {"type":"workspace-write"},
+            "sandbox": {"type":"workspaceWrite"},
             // Synthesize codex-default values for the optional config
             // fields opencode doesn't model itself. Without these the
             // wire shape diverges (codex emits content where bridges
@@ -148,11 +148,12 @@ impl OpencodeBridge {
                 .get("permissionProfile")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "disabled"})),
+            "activePermissionProfile": null,
             "reasoningEffort": params
                 .get("reasoningEffort")
                 .cloned()
                 .unwrap_or_else(|| json!("high")),
-            "serviceTier": json!("default"),
+            "serviceTier": null,
         }))
     }
 
@@ -186,11 +187,29 @@ impl OpencodeBridge {
                 started_at: turn_started_at,
             },
         );
-        let turn =
-            json!({"id":turn_id,"items":[],"status":"inProgress","startedAt":turn_started_at});
+        let turn = json!({
+            "id": turn_id,
+            "items": [],
+            "itemsView": "full",
+            "status": "inProgress",
+            "error": null,
+            "startedAt": null,
+            "completedAt": null,
+            "durationMs": null,
+        });
+        let started_turn = json!({
+            "id": turn_id,
+            "items": [],
+            "itemsView": "full",
+            "status": "inProgress",
+            "error": null,
+            "startedAt": turn_started_at,
+            "completedAt": null,
+            "durationMs": null,
+        });
         let _ = ctx.notifier().send_notification(
             "turn/started",
-            json!({"threadId":thread_id,"turn":turn.clone()}),
+            json!({"threadId":thread_id,"turn":started_turn}),
         );
         let model = params.get("model").and_then(Value::as_str).map(split_model);
         let mut body = json!({ "parts": parts });
@@ -343,10 +362,17 @@ impl OpencodeBridge {
             "instructionSources": [],
             "approvalPolicy": params.get("approvalPolicy").cloned().unwrap_or(json!("untrusted")),
             "approvalsReviewer": params.get("approvalsReviewer").cloned().unwrap_or(json!("user")),
-            "sandbox": {"mode":"workspace-write"},
-            "permissionProfile": params.get("permissionProfile").cloned().unwrap_or(Value::Null),
-            "reasoningEffort": params.get("reasoningEffort").cloned().unwrap_or(Value::Null),
-            "serviceTier": Value::Null
+            "sandbox": {"type":"workspaceWrite"},
+            "permissionProfile": params
+                .get("permissionProfile")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "disabled"})),
+            "activePermissionProfile": null,
+            "reasoningEffort": params
+                .get("reasoningEffort")
+                .cloned()
+                .unwrap_or_else(|| json!("high")),
+            "serviceTier": null
         }))
     }
 
@@ -593,13 +619,14 @@ impl OpencodeBridge {
                 "thread": thread,
                 "model": "opencode",
                 "modelProvider": "opencode",
-                "serviceTier": "default",
+                "serviceTier": null,
                 "cwd": binding.directory,
                 "instructionSources": [],
                 "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",
                 "sandbox": {"type": "dangerFullAccess"},
                 "permissionProfile": {"type": "disabled"},
+                "activePermissionProfile": null,
                 "reasoningEffort": "high",
             }))
         }
@@ -705,11 +732,18 @@ impl OpencodeBridge {
 
     async fn handle_model_list(&self) -> Result<Value, JsonRpcError> {
         let providers = self.client.get("/provider").await.unwrap_or(json!({}));
-        Ok(json!({"data":flatten_models(providers),"nextCursor":null}))
+        let mut models = flatten_models(providers);
+        if models.is_empty() {
+            models.push(default_model_entry("opencode", "opencode", "OpenCode"));
+        }
+        Ok(json!({"data":models,"nextCursor":null}))
     }
 
     async fn handle_config_read(&self) -> Result<Value, JsonRpcError> {
-        Ok(json!({"config": self.client.get("/config").await.unwrap_or(json!({}))}))
+        Ok(json!({
+            "config": self.client.get("/config").await.unwrap_or(json!({})),
+            "origins": {},
+        }))
     }
 
     async fn handle_config_write(&self, params: Value) -> Result<Value, JsonRpcError> {
@@ -718,7 +752,8 @@ impl OpencodeBridge {
     }
 
     async fn handle_mcp_server_status_list(&self) -> Result<Value, JsonRpcError> {
-        Ok(json!({"data": self.client.get("/mcp").await.unwrap_or(json!([]))}))
+        let raw = self.client.get("/mcp").await.unwrap_or(json!([]));
+        Ok(json!({"data":mcp_statuses(raw),"nextCursor":null}))
     }
 }
 
@@ -756,11 +791,16 @@ impl Bridge for OpencodeBridge {
             "model/list" => self.handle_model_list().await,
             "config/read" => self.handle_config_read().await,
             "config/value/write" | "config/batchWrite" => self.handle_config_write(params).await,
+            "configRequirements/read" => Ok(json!({"requirements":null})),
             "mcpServerStatus/list" => self.handle_mcp_server_status_list().await,
             "config/mcpServer/reload" => Ok(json!({})),
+            "mcpServer/oauth/login" => Ok(json!({"authorizationUrl":""})),
             "skills/list" => Ok(json!({"data":[]})),
             "skills/remote/list" | "skills/remote/export" => Ok(json!({"data":[]})),
-            "account/read" => Ok(json!({"account":null,"requiresOpenaiAuth":false})),
+            "skills/config/write" => Ok(json!({
+                "effectiveEnabled": params.get("enabled").and_then(Value::as_bool).unwrap_or(false)
+            })),
+            "account/read" => Ok(json!({"account":{"type":"apiKey"},"requiresOpenaiAuth":false})),
             "account/rateLimits/read" => Ok(json!({"rateLimits":[]})),
             "account/login/start"
             | "account/login/cancel"
@@ -884,7 +924,6 @@ impl OpencodeBridge {
             "exitCode": exit_code,
             "stdout": stdout,
             "stderr": "",
-            "processId": process_id,
         }))
     }
 
@@ -1048,8 +1087,13 @@ fn binding_from_params(
 }
 
 fn binding_to_thread(binding: &OpencodeBinding) -> Value {
+    let path = format!("opencode://session/{}", binding.session_id);
+    let git_info = alleycat_bridge_core::git_info_for_cwd(&binding.directory)
+        .and_then(|info| serde_json::to_value(info).ok())
+        .unwrap_or(Value::Null);
     json!({
         "id": binding.thread_id,
+        "sessionId": binding.session_id,
         "forkedFromId": null,
         "preview": binding.preview,
         "ephemeral": false,
@@ -1060,11 +1104,12 @@ fn binding_to_thread(binding: &OpencodeBinding) -> Value {
         // A bare string here makes the connected client reject the
         // entire response. Mirror the events.rs projection.
         "status": {"type": "notLoaded"},
-        "path": null,
+        "path": path,
         "cwd": binding.directory,
         "cliVersion": concat!("alleycat-opencode-bridge/", env!("CARGO_PKG_VERSION")),
         "source": "appServer",
-        "gitInfo": null,
+        "threadSource": null,
+        "gitInfo": git_info,
         "name": binding.name,
         "turns": []
     })
@@ -1105,16 +1150,75 @@ fn flatten_models(providers: Value) -> Vec<Value> {
                         "displayName": model.get("name").and_then(Value::as_str).unwrap_or(model_id),
                         "description": "",
                         "hidden": false,
-                        "supportedReasoningEfforts": [],
+                        "supportedReasoningEfforts": [{
+                            "reasoningEffort": "medium",
+                            "description": ""
+                        }],
                         "defaultReasoningEffort": "medium",
                         "inputModalities": ["text"],
                         "supportsPersonality": false,
                         "additionalSpeedTiers": [],
+                        "serviceTiers": [{
+                            "id": "standard",
+                            "name": "Standard",
+                            "description": "Default bridge service tier"
+                        }],
                         "isDefault": false
                     })
                 })
         })
         .collect()
+}
+
+fn default_model_entry(provider_id: &str, model_id: &str, display_name: &str) -> Value {
+    json!({
+        "id": format!("{provider_id}/{model_id}"),
+        "model": model_id,
+        "displayName": display_name,
+        "description": "",
+        "hidden": false,
+        "supportedReasoningEfforts": [{
+            "reasoningEffort": "medium",
+            "description": ""
+        }],
+        "defaultReasoningEffort": "medium",
+        "inputModalities": ["text"],
+        "supportsPersonality": false,
+        "additionalSpeedTiers": [],
+        "serviceTiers": [{
+            "id": "standard",
+            "name": "Standard",
+            "description": "Default bridge service tier"
+        }],
+        "isDefault": true
+    })
+}
+
+fn mcp_statuses(raw: Value) -> Vec<Value> {
+    match raw {
+        Value::Array(items) => items,
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(name, value)| {
+                json!({
+                    "name": value.get("name").and_then(Value::as_str).unwrap_or(&name),
+                    "tools": value.get("tools").cloned().unwrap_or_else(|| json!({})),
+                    "resources": value.get("resources").cloned().unwrap_or_else(|| json!([])),
+                    "resourceTemplates": value
+                        .get("resourceTemplates")
+                        .or_else(|| value.get("resource_templates"))
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                    "authStatus": value
+                        .get("authStatus")
+                        .or_else(|| value.get("auth_status"))
+                        .cloned()
+                        .unwrap_or_else(|| json!("unsupported")),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Group an ordered list of opencode messages into codex-shape `Turn`s.
@@ -1180,6 +1284,7 @@ fn turn_from_user_message(message: &Value, tool_context: ToolPartContext<'_>) ->
     json!({
         "id": id,
         "items": items,
+        "itemsView": "full",
         // Without an assistant follow-up the turn is genuinely in-progress
         // from codex's perspective — the user just sent a prompt and is
         // waiting for the model. fold_assistant_into_turn() bumps this to
@@ -1211,6 +1316,7 @@ fn turn_from_assistant_only(message: &Value, tool_context: ToolPartContext<'_>) 
     json!({
         "id": id,
         "items": message_to_turn_items_with_context(message, tool_context),
+        "itemsView": "full",
         "status": if completed_at.is_some() { "completed" } else { "inProgress" },
         "error": opencode_message_error(message),
         "startedAt": started_at,
@@ -1271,11 +1377,7 @@ fn opencode_message_error(message: &Value) -> Option<Value> {
     if msg.is_empty() {
         return None;
     }
-    let code = err.get("name").and_then(Value::as_str);
-    Some(json!({
-        "message": msg,
-        "code": code,
-    }))
+    Some(json!({ "message": msg }))
 }
 
 fn now_secs() -> i64 {

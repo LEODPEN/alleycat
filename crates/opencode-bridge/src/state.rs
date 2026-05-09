@@ -97,6 +97,10 @@ pub struct BridgeState {
     /// Prevents duplicate item-started events when opencode sends multiple
     /// `message.updated` events as the message progresses.
     started_messages: Mutex<HashSet<String>>,
+    /// Set of assistant message ids for which we've already emitted the
+    /// terminal `item/completed`. Used by the session-idle fallback for
+    /// opencode builds that persist message text without sending part deltas.
+    completed_messages: Mutex<HashSet<String>>,
     /// Set of part ids for which we've already emitted `item/started` (used
     /// for tool parts which appear via `message.part.updated`).
     started_parts: Mutex<HashSet<String>>,
@@ -181,6 +185,17 @@ impl BridgeState {
             .unwrap()
             .remove(message_id)
             .unwrap_or_default()
+    }
+
+    pub fn mark_message_completed(&self, message_id: &str) {
+        self.completed_messages
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string());
+    }
+
+    pub fn message_completed(&self, message_id: &str) -> bool {
+        self.completed_messages.lock().unwrap().contains(message_id)
     }
 
     /// Drop bookkeeping for a removed message without emitting anything.

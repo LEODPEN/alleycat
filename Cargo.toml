@@ -4,6 +4,7 @@ members = [
     "crates/bridge-conformance",
     "crates/bridge-core",
     "crates/claude-bridge",
+    "crates/claude-remote-control",
     "crates/codex-proto",
     "crates/pi-bridge",
     "crates/opencode-bridge",
@@ -23,6 +24,7 @@ readme = "README.md"
 alleycat-bridge-core = { path = "crates/bridge-core", version = "0.1" }
 alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
 alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
+alleycat-claude-remote-control = { path = "crates/claude-remote-control", version = "0.1" }
 alleycat-opencode-bridge = { path = "crates/opencode-bridge", version = "0.1" }
 alleycat-pi-bridge = { path = "crates/pi-bridge", version = "0.1" }
 anyhow = "1"

@@ -81,7 +81,7 @@ fn user_input_text_uses_type_tag() {
         json!({
             "type": "text",
             "text": "hello",
-            "textElements": [],
+            "text_elements": [],
         }),
     );
 }
@@ -100,6 +100,8 @@ fn agent_message_item_round_trip() {
         json!({
             "type": "agentMessage",
             "id": "msg_1",
+            "memoryCitation": null,
+            "phase": null,
             "text": "hi",
         }),
     );

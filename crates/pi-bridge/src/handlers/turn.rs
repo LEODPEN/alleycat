@@ -142,6 +142,7 @@ pub async fn handle_turn_start(
     let turn_for_notif = p::Turn {
         id: turn_id.clone(),
         items: Vec::new(),
+        items_view: p::default_items_view(),
         status: p::TurnStatus::InProgress,
         error: None,
         started_at: Some(started_at),
@@ -543,6 +544,7 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         let turn = p::Turn {
             id: args.turn_id.clone(),
             items: Vec::new(),
+            items_view: p::default_items_view(),
             status,
             error,
             started_at: Some(args.started_at),
@@ -579,6 +581,7 @@ fn state_should_emit(state: &Arc<ConnectionState>, notif: &p::ServerNotification
         p::ServerNotification::ThreadClosed(_) => "thread/closed",
         p::ServerNotification::SkillsChanged(_) => "skills/changed",
         p::ServerNotification::ThreadNameUpdated(_) => "thread/name/updated",
+        p::ServerNotification::ThreadGoalCleared(_) => "thread/goal/cleared",
         p::ServerNotification::ThreadTokenUsageUpdated(_) => "thread/tokenUsage/updated",
         p::ServerNotification::TurnStarted(_) => "turn/started",
         p::ServerNotification::TurnCompleted(_) => "turn/completed",
@@ -608,6 +611,7 @@ fn state_should_emit(state: &Arc<ConnectionState>, notif: &p::ServerNotification
         p::ServerNotification::ServerRequestResolved(_) => "serverRequest/resolved",
         p::ServerNotification::McpServerStatusUpdated(_) => "mcpServer/startupStatus/updated",
         p::ServerNotification::AccountRateLimitsUpdated(_) => "account/rateLimits/updated",
+        p::ServerNotification::RemoteControlStatusChanged(_) => "remoteControl/status/changed",
     };
     state.should_emit(method)
 }

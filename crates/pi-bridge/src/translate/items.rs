@@ -98,6 +98,7 @@ fn flush_turn(
     turns.push(Turn {
         id: format!("turn_{}", turns.len()),
         items: std::mem::take(items),
+        items_view: crate::codex_proto::default_items_view(),
         status: TurnStatus::Completed,
         error: None,
         started_at: s,
@@ -206,10 +207,7 @@ fn tool_call_to_item(
         },
         CodexToolKind::FileChange => ThreadItem::FileChange {
             id,
-            changes: crate::translate::events::synthesize_file_changes(
-                &call.name,
-                &call.arguments,
-            ),
+            changes: crate::translate::events::synthesize_file_changes(&call.name, &call.arguments),
             status: match result {
                 None => PatchApplyStatus::InProgress,
                 Some(_) if is_error => PatchApplyStatus::Failed,

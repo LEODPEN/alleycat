@@ -121,8 +121,17 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
             .unwrap_or_else(|| vec![json!("text")]),
         supports_personality: false,
         additional_speed_tiers: Vec::new(),
+        service_tiers: standard_service_tiers(),
         is_default,
     }
+}
+
+fn standard_service_tiers() -> Vec<p::ModelServiceTier> {
+    vec![p::ModelServiceTier {
+        id: "standard".to_string(),
+        name: "Standard".to_string(),
+        description: "Default bridge service tier".to_string(),
+    }]
 }
 
 /// Lossy view over pi's `Model<any>` shape (`pi-mono/packages/ai/src/types.ts`).
