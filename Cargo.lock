@@ -72,6 +72,7 @@ version = "0.1.0"
 dependencies = [
  "alleycat-bridge-core",
  "alleycat-claude-bridge",
+ "alleycat-droid-bridge",
  "alleycat-opencode-bridge",
  "alleycat-pi-bridge",
  "anyhow",
@@ -189,6 +190,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "alleycat-droid-bridge"
+version = "0.1.0"
+dependencies = [
+ "alleycat-bridge-core",
+ "alleycat-codex-proto",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 const CLAUDE_BRIDGE: &str = include_str!("../../claude-bridge/src/bridge.rs");
+const DROID_BRIDGE: &str = include_str!("../../droid-bridge/src/bridge.rs");
 const PI_BRIDGE: &str = include_str!("../../pi-bridge/src/bridge.rs");
 const OPENCODE_BRIDGE: &str = include_str!("../../opencode-bridge/src/handlers/mod.rs");
 
@@ -51,6 +52,7 @@ const STANDARD_REQUEST_METHODS: &[&str] = &[
 fn all_jsonrpc_bridges_account_for_the_standard_method_surface() {
     for (bridge_name, source) in [
         ("claude", CLAUDE_BRIDGE),
+        ("droid", DROID_BRIDGE),
         ("pi", PI_BRIDGE),
         ("opencode", OPENCODE_BRIDGE),
     ] {
@@ -67,6 +69,7 @@ fn all_jsonrpc_bridges_account_for_the_standard_method_surface() {
 fn all_jsonrpc_bridges_own_initialize_separately_from_dispatch() {
     for (bridge_name, source) in [
         ("claude", CLAUDE_BRIDGE),
+        ("droid", DROID_BRIDGE),
         ("pi", PI_BRIDGE),
         ("opencode", OPENCODE_BRIDGE),
     ] {

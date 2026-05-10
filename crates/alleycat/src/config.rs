@@ -60,6 +60,7 @@ pub struct AgentsConfig {
     pub pi: PiAgentConfig,
     pub opencode: OpencodeAgentConfig,
     pub claude: ClaudeAgentConfig,
+    pub droid: DroidAgentConfig,
 }
 
 impl Default for AgentsConfig {
@@ -69,6 +70,7 @@ impl Default for AgentsConfig {
             pi: PiAgentConfig::default(),
             opencode: OpencodeAgentConfig::default(),
             claude: ClaudeAgentConfig::default(),
+            droid: DroidAgentConfig::default(),
         }
     }
 }
@@ -145,6 +147,27 @@ impl Default for ClaudeAgentConfig {
             enabled: true,
             bin: "claude".to_string(),
             bypass_permissions: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DroidAgentConfig {
+    pub enabled: bool,
+    pub bin: String,
+    /// Env var that can provide Factory auth to `droid exec`. The CLI may
+    /// also use its encrypted auth store, but this keeps daemon config
+    /// explicit for headless installs.
+    pub api_key_env: String,
+}
+
+impl Default for DroidAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "droid".to_string(),
+            api_key_env: "FACTORY_API_KEY".to_string(),
         }
     }
 }
@@ -251,5 +274,6 @@ mod tests {
         assert!(config.agents.pi.enabled);
         assert!(config.agents.opencode.enabled);
         assert!(config.agents.claude.enabled);
+        assert!(config.agents.droid.enabled);
     }
 }

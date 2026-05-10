@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 alleycat-bridge-core = { workspace = true }
 alleycat-claude-bridge = { workspace = true }
+alleycat-droid-bridge = { workspace = true }
 alleycat-opencode-bridge = { workspace = true }
 alleycat-pi-bridge = { workspace = true }
 anyhow.workspace = true

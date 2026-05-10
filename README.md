@@ -2,7 +2,7 @@
 
 ![Alleycat logo](assets/alleycat-logo.png)
 
-Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, OpenCode, and Claude — onto a single QUIC connection. Run the daemon on your machine, scan a QR with a paired client, and the client picks an agent over the same stream multiplexer.
+Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, OpenCode, Claude, and Factory Droid — onto a single QUIC connection. Run the daemon on your machine, scan a QR with a paired client, and the client picks an agent over the same stream multiplexer.
 
 ## Install
 
@@ -33,6 +33,7 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 | `opencode` | See [opencode docs](https://opencode.ai). |
 | `pi` | See pi-mono docs. |
 | `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
+| `droid` | Install Factory Droid, then either run `droid login` once or set `FACTORY_API_KEY` in the daemon environment. |
 
 ## Commands
 
@@ -60,6 +61,7 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 | `pi` | Yes, per codex thread | `PiPool` spawns `pi --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
 | `opencode` | Yes, one shared backend | Lazy spawn of `opencode serve --port=auto --auth-token=auto` on first connect, gated on `/global/health`. Or set `OPENCODE_BRIDGE_BACKEND_URL` to point at an existing instance. |
 | `claude` | Yes, per codex thread | `ClaudePool` spawns `claude -p --input-format stream-json --output-format stream-json --session-id <thread_id> --dangerously-skip-permissions` on demand. Same 16-cap, 10-minute idle reap, LRU eviction as pi. Sessions resume on next access via `--resume <thread_id>`. |
+| `droid` | Yes, per codex thread | Spawns `droid exec --input-format stream-jsonrpc --output-format stream-jsonrpc --cwd <cwd>` and translates Factory session notifications into the codex app-server wire. |
 
 ## Pair payload
 
@@ -88,7 +90,7 @@ or
 {"op": "connect", "v": 1, "token": "...", "agent": "codex"}
 ```
 
-The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `opencode`, and `claude`.
+The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `opencode`, `claude`, and `droid`.
 
 ## Configuration
 
@@ -115,9 +117,14 @@ bin = "opencode"
 [agents.claude]
 enabled = true
 bin = "claude"
+
+[agents.droid]
+enabled = true
+bin = "droid"
+api_key_env = "FACTORY_API_KEY"
 ```
 
-Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, and OpenCode's `bin`/runtime port are pinned at first spawn; changing those requires `alleycat stop` + `serve`.
+Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, OpenCode's `bin`/runtime port, and Droid's `bin` are pinned at first spawn; changing those requires `alleycat stop` + `serve`.
 
 ## File layout
 
@@ -135,7 +142,7 @@ The Unix control socket falls through `XDG_RUNTIME_DIR` → state dir → `TMPDI
 
 ## Notes
 
-- Codex, Pi, OpenCode, and Claude children inherit `kill_on_drop` semantics, so they exit when the daemon does.
+- Codex, Pi, OpenCode, Claude, and Droid children inherit `kill_on_drop` semantics, so they exit when the daemon does.
 - `alleycat stop` shuts the iroh endpoint and the daemon process; launchd / systemd will restart it under their normal supervision.
 
 ## Building from source
@@ -147,13 +154,16 @@ cargo build --release -p alleycat
 target/release/alleycat install
 ```
 
-The workspace has six crates:
+The workspace crates are:
 
 - `crates/alleycat` — `alleycat` daemon binary. Owns the iroh endpoint, the persistent identity, the agent dispatcher, and an OS-native control socket so the CLI can talk to the running daemon.
+- `crates/bridge-conformance` — live conformance harness for comparing bridge behavior against codex app-server wire shapes.
 - `crates/bridge-core` — shared JSON-RPC framing, server scaffolding, and notification plumbing used by the bridges.
 - `crates/codex-proto` — shared codex `app-server` v2 wire shapes used by every bridge.
 - `crates/pi-bridge` — `pi-coding-agent` process pool plus a codex-shaped JSON-RPC translator (one pi process per codex thread).
 - `crates/opencode-bridge` — single shared `opencode serve` backend wrapped in the same JSON-RPC surface.
 - `crates/claude-bridge` — `claude -p --output-format stream-json` process pool wrapped in the same JSON-RPC surface (one claude process per codex thread).
+- `crates/droid-bridge` — Factory Droid `stream-jsonrpc` process wrapper plus codex-shaped turn/tool translation (one droid process per codex thread).
+- `crates/claude-remote-control` — auxiliary Claude remote-control protocol support.
 
 Releases are produced from the [`litter`](https://github.com/dnakov/litter) repo, which carries this repo as a submodule under `shared/third_party/alleycat` and runs [`dist`](https://github.com/axodotdev/cargo-dist) against the `kittylitter` wrapper to build platform release artifacts and publish the npm package. Homebrew, shell installer, PowerShell installer, and MSI publishing are disabled in litter's release config right now. To cut a release: bump `version` in the root `Cargo.toml` here, push, then bump the submodule pin in litter and tag `vX.Y.Z` there.

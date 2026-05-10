@@ -13,6 +13,7 @@ use crate::transport::JsonRpcClient;
 
 pub mod claude;
 pub mod codex;
+pub mod droid;
 pub mod opencode;
 pub mod pi;
 
@@ -76,6 +77,7 @@ pub async fn spawn(opts: TargetSpawn) -> Result<TargetHandle> {
         TargetId::Pi => pi::spawn(opts).await,
         TargetId::Claude => claude::spawn(opts).await,
         TargetId::Opencode => opencode::spawn(opts).await,
+        TargetId::Droid => droid::spawn(opts).await,
     }
 }
 

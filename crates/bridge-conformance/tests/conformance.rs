@@ -1,11 +1,11 @@
 //! Conformance test entry points. Each `#[ignore]`d test drives one target
 //! through the canonical scenario; the aggregate `conformance_diff` runs all
-//! four and diffs each bridge against the codex reference.
+//! bridge targets and diffs each bridge against the codex reference.
 //!
 //! Run with:
 //!   cargo test -p alleycat-bridge-conformance -- --ignored --nocapture
 //!
-//! Without prereqs (no codex, no pi/claude/opencode CLIs, no API keys) the
+//! Without prereqs (no codex, no pi/claude/opencode/droid CLIs, no API keys) the
 //! suite still passes — each test prints `skipped: <reason>` and exits.
 
 use std::path::PathBuf;
@@ -43,12 +43,18 @@ async fn conformance_opencode() {
     run_target(TargetId::Opencode).await;
 }
 
+#[tokio::test]
+#[ignore = "live conformance — requires `droid` CLI"]
+async fn conformance_droid() {
+    run_target(TargetId::Droid).await;
+}
+
 /// Aggregate test: capture transcripts from every available target and
 /// diff each non-codex target against codex (the reference). Skips any
 /// target whose prereqs aren't met. Skips entirely if codex itself is
 /// unavailable.
 #[tokio::test]
-#[ignore = "live conformance — runs all four targets and diffs them"]
+#[ignore = "live conformance — runs all targets and diffs them"]
 async fn conformance_diff_all_against_codex() {
     let codex_transcript = match drive_fresh(TargetId::Codex).await {
         DriveOutcome::Ran(t) => t,
@@ -66,7 +72,12 @@ async fn conformance_diff_all_against_codex() {
     );
 
     let mut had_findings = false;
-    for target in [TargetId::Pi, TargetId::Claude, TargetId::Opencode] {
+    for target in [
+        TargetId::Pi,
+        TargetId::Claude,
+        TargetId::Opencode,
+        TargetId::Droid,
+    ] {
         match drive_fresh(target).await {
             DriveOutcome::Ran(t) => {
                 eprintln!(
@@ -222,6 +233,12 @@ fn build_spawn(
         (TargetId::Opencode, Prereq::Opencode { bin }) => TargetSpawn {
             target,
             bridge_bin: Some(workspace_bin("alleycat-opencode-bridge")?),
+            backend_bin: Some(bin.clone()),
+            cwd,
+        },
+        (TargetId::Droid, Prereq::Droid { bin }) => TargetSpawn {
+            target,
+            bridge_bin: Some(workspace_bin("alleycat-droid-bridge")?),
             backend_bin: Some(bin.clone()),
             cwd,
         },

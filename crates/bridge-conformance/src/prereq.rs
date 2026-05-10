@@ -14,6 +14,7 @@ pub enum Prereq {
     Pi { bin: PathBuf },
     Claude { bin: PathBuf },
     Opencode { bin: PathBuf },
+    Droid { bin: PathBuf },
 }
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub async fn check(target: TargetId) -> Result<Prereq, SkipReason> {
         TargetId::Pi => check_pi(),
         TargetId::Claude => check_claude(),
         TargetId::Opencode => check_opencode(),
+        TargetId::Droid => check_droid(),
     }
 }
 
@@ -64,6 +66,18 @@ fn check_opencode() -> Result<Prereq, SkipReason> {
     Ok(Prereq::Opencode { bin })
 }
 
+fn check_droid() -> Result<Prereq, SkipReason> {
+    let bin = which_or_env("DROID_BRIDGE_DROID_BIN", "droid")
+        .ok_or_else(|| SkipReason::Reason("droid not on PATH".into()))?;
+    if has_factory_auth() {
+        Ok(Prereq::Droid { bin })
+    } else {
+        Err(SkipReason::Reason(
+            "droid auth unavailable: set FACTORY_API_KEY or run droid login".into(),
+        ))
+    }
+}
+
 fn which_or_env(env_var: &str, bin_name: &str) -> Option<PathBuf> {
     if let Some(p) = env::var_os(env_var) {
         if !p.is_empty() {
@@ -74,4 +88,16 @@ fn which_or_env(env_var: &str, bin_name: &str) -> Option<PathBuf> {
         }
     }
     which::which(bin_name).ok()
+}
+
+fn has_factory_auth() -> bool {
+    if env::var_os("FACTORY_API_KEY").is_some() {
+        return true;
+    }
+    let Some(home) = env::var_os("HOME") else {
+        return false;
+    };
+    PathBuf::from(home)
+        .join(".factory/auth.encrypted")
+        .is_file()
 }

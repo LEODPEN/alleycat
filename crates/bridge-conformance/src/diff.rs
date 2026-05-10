@@ -356,6 +356,25 @@ impl KnownDivergence {
                 ),
                 field_path_divergences: COMMON_FIELD_DIVERGENCES,
             },
+            TargetId::Droid => Self {
+                target,
+                skipped_methods: concat_static(
+                    &[
+                        "mcpServer/oauth/login",
+                        "thread/fork",
+                        "thread/archive",
+                        "thread/unarchive",
+                        "thread/rollback",
+                        "review/start",
+                    ],
+                    SHAPE_DIVERGENT_RESPONSES,
+                ),
+                skipped_notifications: concat_static(
+                    &["thread/name/updated"],
+                    SHAPE_DIVERGENT_NOTIFICATIONS,
+                ),
+                field_path_divergences: COMMON_FIELD_DIVERGENCES,
+            },
         }
     }
 }

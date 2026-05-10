@@ -29,7 +29,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One of the four implementations the harness can run against.
+/// One of the implementations the harness can run against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetId {
     /// Real `codex app-server` over TCP — the canonical reference.
@@ -40,6 +40,8 @@ pub enum TargetId {
     Claude,
     /// `alleycat-opencode-bridge` over Unix socket (`opencode serve` backend).
     Opencode,
+    /// `alleycat-droid-bridge` over stdio (`droid exec` backend).
+    Droid,
 }
 
 impl TargetId {
@@ -48,6 +50,7 @@ impl TargetId {
         TargetId::Pi,
         TargetId::Claude,
         TargetId::Opencode,
+        TargetId::Droid,
     ];
 
     pub fn label(self) -> &'static str {
@@ -56,6 +59,7 @@ impl TargetId {
             TargetId::Pi => "pi",
             TargetId::Claude => "claude",
             TargetId::Opencode => "opencode",
+            TargetId::Droid => "droid",
         }
     }
 }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
 use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
+use alleycat_droid_bridge::DroidBridge;
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
@@ -30,6 +31,7 @@ pub enum AgentKind {
     Pi,
     Claude,
     Opencode,
+    Droid,
 }
 
 /// How the daemon talks to `codex app-server`. Selected at startup by
@@ -119,9 +121,21 @@ impl AgentManager {
             .await
             .context("building claude bridge")?;
 
+        let mut droid_builder = DroidBridge::builder()
+            .agent_bin(snapshot.agents.droid.bin.clone())
+            .launcher(Arc::new(LocalLauncher));
+        if let Some(ref home) = codex_home {
+            droid_builder = droid_builder.codex_home(home.clone());
+        }
+        let droid_bridge = droid_builder
+            .build()
+            .await
+            .context("building droid bridge")?;
+
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
 
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
@@ -198,6 +212,12 @@ impl AgentManager {
                 wire: AgentWire::Jsonl,
                 available: self.claude_available(),
             },
+            AgentInfo {
+                name: "droid".to_string(),
+                display_name: "Droid".to_string(),
+                wire: AgentWire::Jsonl,
+                available: self.droid_available(),
+            },
         ]
     }
 
@@ -267,6 +287,7 @@ impl AgentManager {
             "pi" => Some("pi"),
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
+            "droid" => Some("droid"),
             _ => None,
         }
     }
@@ -278,6 +299,7 @@ impl AgentManager {
             "pi" => cfg.agents.pi.enabled,
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
+            "droid" => cfg.agents.droid.enabled,
             _ => false,
         }
     }
@@ -462,6 +484,13 @@ impl AgentManager {
         let cfg = self.config.load();
         cfg.agents.claude.enabled && which::which(&cfg.agents.claude.bin).is_ok()
     }
+
+    fn droid_available(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.droid.enabled
+            && which::which(&cfg.agents.droid.bin).is_ok()
+            && has_factory_auth(&cfg.agents.droid.api_key_env)
+    }
 }
 
 /// Probe `<bin> app-server --help` and check whether the `--listen` flag
@@ -593,6 +622,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "pi" => Some(AgentKind::Pi),
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
+        "droid" => Some(AgentKind::Droid),
         _ => None,
     }
 }
@@ -602,6 +632,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Pi => "pi",
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
+        AgentKind::Droid => "droid",
     }
 }
 
@@ -611,6 +642,19 @@ impl crate::config::AgentsConfig {
             AgentKind::Pi => self.pi.enabled,
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
+            AgentKind::Droid => self.droid.enabled,
         }
     }
+}
+
+fn has_factory_auth(api_key_env: &str) -> bool {
+    if std::env::var_os(api_key_env).is_some() {
+        return true;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    PathBuf::from(home)
+        .join(".factory/auth.encrypted")
+        .is_file()
 }
