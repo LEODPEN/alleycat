@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// A single binding: codex thread ↔ Hermes session.
@@ -13,7 +13,18 @@ pub struct HermesBinding {
     pub hermes_session_id: String,
     pub model: Option<String>,
     pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
     pub preview: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub forked_from_id: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Persisted index structure.
@@ -25,7 +36,7 @@ struct PersistedIndex {
 
 /// Thread-safe in-memory (optionally persisted) thread index.
 pub struct ThreadIndex {
-    path: PathBuf,
+    path: Option<PathBuf>,
     inner: Mutex<Inner>,
 }
 
@@ -39,7 +50,7 @@ impl ThreadIndex {
     /// Create an in-memory index (no persistence).
     pub fn new_in_memory() -> Self {
         Self {
-            path: PathBuf::from("/dev/null"),
+            path: None,
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -47,23 +58,29 @@ impl ThreadIndex {
     /// Open or create the index at `path`.
     #[allow(dead_code)]
     pub async fn open(path: PathBuf) -> anyhow::Result<Self> {
+        Self::open_sync(path)
+    }
+
+    /// Synchronous open used by bridge construction.
+    pub fn open_sync(path: PathBuf) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            std::fs::create_dir_all(parent)?;
         }
-        let persisted = match tokio::fs::read_to_string(&path).await {
+        let persisted = match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => serde_json::from_str::<PersistedIndex>(&text)?,
             _ => PersistedIndex::default(),
         };
         let mut by_thread = HashMap::new();
         let mut by_session = HashMap::new();
-        for b in persisted.bindings {
-            let sid = b.hermes_session_id.clone();
-            let tid = b.thread_id.clone();
+        for mut binding in persisted.bindings {
+            normalize_binding(&mut binding);
+            let sid = binding.hermes_session_id.clone();
+            let tid = binding.thread_id.clone();
             by_session.insert(sid, tid.clone());
-            by_thread.insert(tid, b);
+            by_thread.insert(tid, binding);
         }
         Ok(Self {
-            path,
+            path: Some(path),
             inner: Mutex::new(Inner {
                 by_thread,
                 by_session,
@@ -72,7 +89,8 @@ impl ThreadIndex {
     }
 
     /// Insert or update a binding.
-    pub fn upsert(&self, binding: HermesBinding) {
+    pub fn upsert(&self, mut binding: HermesBinding) {
+        normalize_binding(&mut binding);
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.by_thread.remove(&binding.thread_id) {
             inner.by_session.remove(&old.hermes_session_id);
@@ -100,6 +118,7 @@ impl ThreadIndex {
     }
 
     /// Remove a binding and return it.
+    #[allow(dead_code)]
     pub fn remove(&self, thread_id: &str) -> Option<HermesBinding> {
         let mut inner = self.inner.lock().unwrap();
         let binding = inner.by_thread.remove(thread_id);
@@ -109,24 +128,116 @@ impl ThreadIndex {
         binding
     }
 
-    /// All thread ids in the index.
-    pub fn thread_ids(&self) -> Vec<String> {
-        self.inner
+    pub fn all(&self) -> Vec<HermesBinding> {
+        let mut bindings: Vec<_> = self
+            .inner
             .lock()
             .unwrap()
             .by_thread
-            .keys()
+            .values()
             .cloned()
+            .collect();
+        bindings.sort_by_key(|binding| std::cmp::Reverse(binding.updated_at));
+        bindings
+    }
+
+    /// All non-archived thread ids in the index.
+    pub fn thread_ids(&self) -> Vec<String> {
+        self.all()
+            .into_iter()
+            .filter(|binding| !binding.archived)
+            .map(|binding| binding.thread_id)
             .collect()
     }
 
-    /// Persist to disk.
+    pub fn set_archived(
+        &self,
+        thread_id: &str,
+        archived: bool,
+        updated_at: i64,
+    ) -> Option<HermesBinding> {
+        let mut inner = self.inner.lock().unwrap();
+        let binding = inner.by_thread.get_mut(thread_id)?;
+        binding.archived = archived;
+        binding.updated_at = updated_at;
+        Some(binding.clone())
+    }
+
+    pub fn set_name(
+        &self,
+        thread_id: &str,
+        name: Option<String>,
+        updated_at: i64,
+    ) -> Option<HermesBinding> {
+        let mut inner = self.inner.lock().unwrap();
+        let binding = inner.by_thread.get_mut(thread_id)?;
+        binding.name = name;
+        binding.updated_at = updated_at;
+        Some(binding.clone())
+    }
+
+    pub fn update_after_turn(
+        &self,
+        thread_id: &str,
+        hermes_session_id: Option<String>,
+        model: Option<String>,
+        preview: Option<String>,
+        cwd: Option<String>,
+        updated_at: i64,
+    ) -> Option<HermesBinding> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut old_session_id = None;
+        let mut new_session_id = None;
+        let updated = {
+            let binding = inner.by_thread.get_mut(thread_id)?;
+            if let Some(session_id) = hermes_session_id {
+                old_session_id = Some(std::mem::replace(
+                    &mut binding.hermes_session_id,
+                    session_id.clone(),
+                ));
+                new_session_id = Some(session_id);
+            }
+            if model.is_some() {
+                binding.model = model;
+            }
+            if preview.as_deref().is_some_and(|value| !value.is_empty()) {
+                binding.preview = preview;
+            }
+            if cwd.is_some() {
+                binding.cwd = cwd;
+            }
+            binding.updated_at = updated_at;
+            binding.clone()
+        };
+        if let Some(old) = old_session_id {
+            inner.by_session.remove(&old);
+        }
+        if let Some(new) = new_session_id {
+            inner.by_session.insert(new, thread_id.to_string());
+        }
+        Some(updated)
+    }
+
+    /// Persist to disk. In-memory indexes intentionally no-op.
     pub fn persist(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let inner = self.inner.lock().unwrap();
-        let bindings: Vec<_> = inner.by_thread.values().cloned().collect();
+        let mut bindings: Vec<_> = inner.by_thread.values().cloned().collect();
+        bindings.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
         let data = PersistedIndex { bindings };
         let json = serde_json::to_string_pretty(&data)?;
-        std::fs::write(&self.path, json)?;
+        std::fs::write(path, json)?;
         Ok(())
+    }
+}
+
+fn normalize_binding(binding: &mut HermesBinding) {
+    if binding.updated_at == 0 {
+        binding.updated_at = binding.created_at;
     }
 }

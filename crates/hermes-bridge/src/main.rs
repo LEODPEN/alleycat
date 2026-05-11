@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 #[cfg(unix)]
 use alleycat_bridge_core::ServerOptions;
-use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
+use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig, HermesMode};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let bridge = Arc::new(HermesBridge::new(HermesBridgeConfig::default()));
+    let bridge = Arc::new(HermesBridge::new(config_from_env()));
 
     match socket_arg() {
         Some(path) => {
@@ -38,6 +38,31 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         None => alleycat_bridge_core::serve_stdio(bridge).await,
+    }
+}
+
+fn config_from_env() -> HermesBridgeConfig {
+    let mode = match std::env::var("HERMES_BRIDGE_MODE")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "api" => HermesMode::Api {
+            api_base: std::env::var("HERMES_API_BASE")
+                .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string()),
+        },
+        "cli" => HermesMode::Cli {
+            bin: std::env::var("HERMES_BRIDGE_BIN").ok(),
+        },
+        _ => HermesMode::Auto {
+            api_base: std::env::var("HERMES_API_BASE")
+                .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string()),
+            bin: std::env::var("HERMES_BRIDGE_BIN").ok(),
+        },
+    };
+    HermesBridgeConfig {
+        mode,
+        state_dir: std::env::var("HERMES_BRIDGE_STATE_DIR").ok(),
     }
 }
 

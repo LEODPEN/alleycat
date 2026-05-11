@@ -1,39 +1,59 @@
 //! Hermes Bridge — Bridge trait implementation.
 //!
 //! Translates between the codex app-server JSON-RPC surface and the
-//! Hermes Agent backend (API or CLI mode).
+//! Hermes Agent backend (API or CLI mode). Core chat/thread methods are
+//! implemented; unsupported Codex-only features return explicit -32601 errors.
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::process::Command;
 
 use alleycat_bridge_core::{Bridge, Conn, JsonRpcError};
+use alleycat_codex_proto::account::{
+    Account, CancelLoginAccountResponse, CancelLoginAccountStatus, GetAccountRateLimitsResponse,
+    GetAccountResponse, LoginAccountResponse, LogoutAccountResponse,
+};
+use alleycat_codex_proto::command_exec::{
+    CommandExecParams, CommandExecResizeResponse, CommandExecResponse,
+    CommandExecTerminateResponse, CommandExecWriteResponse,
+};
 use alleycat_codex_proto::common::{
-    ApprovalsReviewer, AskForApproval, ReasoningEffort, SessionSource, ThreadStatus, TurnStatus,
+    ApprovalsReviewer, AskForApproval, ReasoningEffort, SandboxMode, SessionSource, ThreadStatus,
+    TurnStatus,
+};
+use alleycat_codex_proto::config::{
+    ConfigReadResponse, ConfigRequirementsReadResponse, ConfigWriteResponse, WriteStatus,
 };
 use alleycat_codex_proto::items::{ThreadItem, UserInput};
 use alleycat_codex_proto::lifecycle::InitializeResponse;
+use alleycat_codex_proto::mcp::{
+    ListMcpServerStatusResponse, McpServerOauthLoginResponse, McpServerRefreshResponse,
+};
 use alleycat_codex_proto::model::ModelListResponse;
 use alleycat_codex_proto::notifications::{
     AgentMessageDeltaNotification, ItemCompletedNotification, ItemStartedNotification,
-    ThreadStartedNotification, TurnCompletedNotification, TurnStartedNotification,
+    ThreadIdOnly, ThreadNameUpdatedNotification, ThreadStartedNotification,
+    TurnCompletedNotification, TurnStartedNotification,
 };
+use alleycat_codex_proto::skills::{SkillsConfigWriteResponse, SkillsListResponse};
 use alleycat_codex_proto::thread::{
-    Thread, ThreadForkParams, ThreadListParams, ThreadListResponse, ThreadResumeParams,
-    ThreadStartParams, ThreadStartResponse, Turn,
+    Thread, ThreadArchiveParams, ThreadArchiveResponse, ThreadBackgroundTerminalsCleanResponse,
+    ThreadForkParams, ThreadForkResponse, ThreadListParams, ThreadListResponse,
+    ThreadLoadedListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
+    ThreadResumeResponse, ThreadRollbackParams, ThreadSetNameParams, ThreadSetNameResponse,
+    ThreadStartParams, ThreadStartResponse, ThreadTurnsListParams, ThreadTurnsListResponse, Turn,
 };
-use alleycat_codex_proto::turn::{TurnStartParams, TurnStartResponse};
+use alleycat_codex_proto::turn::{TurnInterruptResponse, TurnStartParams, TurnStartResponse};
 
 use crate::api_client::{CreateRunRequest, DEFAULT_API_KEY_ENV, HermesApiClient};
 use crate::config::HermesBridgeConfig;
 use crate::index::{HermesBinding, ThreadIndex};
 use crate::state::{ActiveTurn, TurnState};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn random_hex(len: usize) -> String {
     use rand::RngCore;
@@ -63,6 +83,49 @@ fn error_response(code: i64, message: &str) -> Result<Value, JsonRpcError> {
     Err(rpc_error(code, message))
 }
 
+fn to_value<T: serde::Serialize>(value: T) -> Result<Value, JsonRpcError> {
+    serde_json::to_value(value).map_err(|e| rpc_error(-32603, format!("serialize response: {e}")))
+}
+
+fn default_cwd() -> String {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/tmp".to_string())
+}
+
+fn user_text(input: &[UserInput]) -> String {
+    input
+        .iter()
+        .filter_map(|inp| match inp {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+fn preview_for(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(120).collect())
+    }
+}
+
+fn truncate_string(value: &mut String, cap: usize) {
+    if value.len() <= cap {
+        return;
+    }
+    let mut end = cap;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str("\n...[truncated]");
+}
+
 fn completed_turn(turn_id: &str) -> Turn {
     Turn {
         id: turn_id.to_string(),
@@ -76,14 +139,11 @@ fn completed_turn(turn_id: &str) -> Turn {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HermesBridge
-// ---------------------------------------------------------------------------
-
 pub struct HermesBridge {
     config: HermesBridgeConfig,
     index: Arc<ThreadIndex>,
     state: Arc<TurnState>,
+    turns: Arc<Mutex<HashMap<String, Vec<Turn>>>>,
     api_client: Arc<HermesApiClient>,
 }
 
@@ -92,65 +152,157 @@ impl HermesBridge {
         let api_base = match &config.mode {
             crate::config::HermesMode::Api { api_base } => api_base.clone(),
             crate::config::HermesMode::Auto { api_base, .. } => api_base.clone(),
-            crate::config::HermesMode::Cli { .. } => "http://localhost:8321".to_string(),
+            crate::config::HermesMode::Cli { .. } => {
+                crate::api_client::DEFAULT_API_BASE.to_string()
+            }
         };
-        let api_key = std::env::var("API_SERVER_KEY")
-            .or_else(|_| std::env::var(DEFAULT_API_KEY_ENV))
+        let api_key = std::env::var(DEFAULT_API_KEY_ENV)
+            .or_else(|_| std::env::var("API_SERVER_KEY"))
             .ok();
+        let index = config
+            .state_dir
+            .as_ref()
+            .and_then(|dir| ThreadIndex::open_sync(PathBuf::from(dir).join("threads.json")).ok())
+            .unwrap_or_else(ThreadIndex::new_in_memory);
         Self {
             config,
-            index: Arc::new(ThreadIndex::new_in_memory()),
+            index: Arc::new(index),
             state: Arc::new(TurnState::new()),
+            turns: Arc::new(Mutex::new(HashMap::new())),
             api_client: Arc::new(HermesApiClient::new(&api_base, api_key)),
         }
     }
 
-    fn make_thread(thread_id: &str, session_id: &str) -> Thread {
+    fn binding_to_thread(binding: &HermesBinding) -> Thread {
         let now = epoch_ms();
         Thread {
-            id: thread_id.to_string(),
-            session_id: session_id.to_string(),
-            forked_from_id: None,
-            preview: String::new(),
-            ephemeral: true,
+            id: binding.thread_id.clone(),
+            session_id: binding.hermes_session_id.clone(),
+            forked_from_id: binding.forked_from_id.clone(),
+            preview: binding.preview.clone().unwrap_or_default(),
+            ephemeral: false,
             model_provider: "hermes-agent".to_string(),
-            created_at: now,
-            updated_at: now,
+            created_at: binding.created_at,
+            updated_at: if binding.updated_at == 0 {
+                now
+            } else {
+                binding.updated_at
+            },
             status: ThreadStatus::Idle,
             path: None,
-            cwd: "/tmp".to_string(),
+            cwd: binding.cwd.clone().unwrap_or_else(default_cwd),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             source: SessionSource::AppServer,
             thread_source: None,
             agent_nickname: Some("hermes".to_string()),
             agent_role: Some("assistant".to_string()),
             git_info: None,
-            name: None,
+            name: binding.name.clone(),
             turns: vec![],
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Bridge trait
-// ---------------------------------------------------------------------------
+    fn start_like_response(thread: Thread, model: Option<String>) -> ThreadResumeResponse {
+        let cwd = thread.cwd.clone();
+        let model = model.unwrap_or_else(|| "hermes-agent".to_string());
+        ThreadResumeResponse {
+            thread,
+            model,
+            model_provider: "hermes-agent".to_string(),
+            service_tier: None,
+            cwd,
+            instruction_sources: vec![],
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox: json!({"type": "danger-full-access"}),
+            permission_profile: None,
+            active_permission_profile: None,
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        }
+    }
+
+    fn persist_index(&self) -> Result<(), JsonRpcError> {
+        self.index
+            .persist()
+            .map_err(|e| rpc_error(-32603, format!("persist thread index: {e}")))
+    }
+
+    fn start_logged_turn(&self, thread_id: &str, turn_id: &str) {
+        let turn = Turn {
+            id: turn_id.to_string(),
+            items: vec![],
+            items_view: "full".to_string(),
+            status: TurnStatus::InProgress,
+            error: None,
+            started_at: Some(epoch_ms()),
+            completed_at: None,
+            duration_ms: None,
+        };
+        self.turns
+            .lock()
+            .unwrap()
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(turn);
+    }
+
+    fn push_logged_item(&self, thread_id: &str, turn_id: &str, item: ThreadItem) {
+        if let Some(turn) = self
+            .turns
+            .lock()
+            .unwrap()
+            .get_mut(thread_id)
+            .and_then(|turns| turns.iter_mut().rev().find(|turn| turn.id == turn_id))
+        {
+            turn.items.push(item);
+        }
+    }
+
+    fn complete_logged_turn(&self, thread_id: &str, turn_id: &str, error: Option<String>) {
+        if let Some(turn) = self
+            .turns
+            .lock()
+            .unwrap()
+            .get_mut(thread_id)
+            .and_then(|turns| turns.iter_mut().rev().find(|turn| turn.id == turn_id))
+        {
+            turn.status = if error.is_some() {
+                TurnStatus::Failed
+            } else {
+                TurnStatus::Completed
+            };
+            turn.error = error.map(|message| alleycat_codex_proto::common::TurnError {
+                message,
+                codex_error_info: None,
+                additional_details: None,
+            });
+            turn.completed_at = Some(epoch_ms());
+        }
+    }
+
+    fn logged_turns(&self, thread_id: &str) -> Vec<Turn> {
+        self.turns
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
 
 #[async_trait]
 impl Bridge for HermesBridge {
     async fn initialize(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
         ctx.set_initialize_capabilities(&params);
-
         let home = directories::ProjectDirs::from("", "", "alleycat")
             .map(|d| d.data_dir().to_string_lossy().to_string())
             .unwrap_or_else(|| "/tmp/alleycat".to_string());
-
-        let resp = InitializeResponse {
+        to_value(InitializeResponse {
             user_agent: format!("hermes-bridge/{}", env!("CARGO_PKG_VERSION")),
             codex_home: home,
             platform_family: "linux".to_string(),
             platform_os: std::env::consts::OS.to_string(),
-        };
-        Ok(serde_json::to_value(resp).unwrap_or_default())
+        })
     }
 
     async fn dispatch(
@@ -160,7 +312,6 @@ impl Bridge for HermesBridge {
         params: Value,
     ) -> Result<Value, JsonRpcError> {
         match method {
-            // ---- Thread lifecycle ----
             "thread/start" => self.handle_thread_start(ctx, params).await,
             "thread/resume" => self.handle_thread_resume(ctx, params).await,
             "thread/fork" => self.handle_thread_fork(ctx, params).await,
@@ -177,165 +328,225 @@ impl Bridge for HermesBridge {
                 self.handle_thread_background_terminals_clean(ctx, params)
                     .await
             }
-
-            // ---- Turn lifecycle ----
             "turn/start" => self.handle_turn_start(ctx, params).await,
             "turn/steer" => self.handle_turn_steer(ctx, params).await,
             "turn/interrupt" => self.handle_turn_interrupt(ctx, params).await,
-
-            // ---- Review ----
             "review/start" => self.handle_review_start(ctx, params).await,
-
-            // ---- Models ----
             "model/list" => self.handle_model_list(ctx, params).await,
-
-            // ---- Account ----
             "account/read" => self.handle_account_read(ctx, params).await,
             "account/rateLimits/read" => self.handle_account_rate_limits_read(ctx, params).await,
             "account/login/start" => self.handle_account_login_start(ctx, params).await,
             "account/login/cancel" => self.handle_account_login_cancel(ctx, params).await,
             "account/logout" => self.handle_account_logout(ctx, params).await,
-
-            // ---- Config ----
             "config/read" => self.handle_config_read(ctx, params).await,
             "config/value/write" => self.handle_config_value_write(ctx, params).await,
             "config/batchWrite" => self.handle_config_batch_write(ctx, params).await,
             "configRequirements/read" => self.handle_config_requirements_read(ctx, params).await,
-
-            // ---- MCP ----
             "mcpServerStatus/list" => self.handle_mcp_server_status_list(ctx, params).await,
             "config/mcpServer/reload" => self.handle_config_mcp_server_reload(ctx, params).await,
             "mcpServer/oauth/login" => self.handle_mcp_server_oauth_login(ctx, params).await,
-
-            // ---- Skills ----
             "skills/list" => self.handle_skills_list(ctx, params).await,
             "skills/remote/list" => self.handle_skills_remote_list(ctx, params).await,
             "skills/remote/export" => self.handle_skills_remote_export(ctx, params).await,
             "skills/config/write" => self.handle_skills_config_write(ctx, params).await,
-
-            // ---- Command ----
             "command/exec" => self.handle_command_exec(ctx, params).await,
             "command/exec/write" => self.handle_command_exec_write(ctx, params).await,
             "command/exec/terminate" => self.handle_command_exec_terminate(ctx, params).await,
             "command/exec/resize" => self.handle_command_exec_resize(ctx, params).await,
-
-            // ---- Experimental ----
             "mock/experimentalMethod" => self.handle_mock_experimental_method(ctx, params).await,
             "experimentalFeature/list" => self.handle_experimental_feature_list(ctx, params).await,
             "collaborationMode/list" => self.handle_collaboration_mode_list(ctx, params).await,
-
-            // ---- Feedback ----
             "feedback/upload" => self.handle_feedback_upload(ctx, params).await,
-
             _ => error_response(-32601, &format!("Method not found: {method}")),
         }
     }
 
     async fn notification(&self, _ctx: &Conn, _method: &str, _params: Value) {
-        // Hermes bridge does not server-initiate notifications on its own.
+        // No client-originated notifications currently require bridge-side state changes.
     }
 }
 
-// ---------------------------------------------------------------------------
-// Thread handlers
-// ---------------------------------------------------------------------------
-
 impl HermesBridge {
     async fn handle_thread_start(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let p: ThreadStartParams = serde_json::from_value(params.clone())
+        let p: ThreadStartParams = serde_json::from_value(params)
             .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-
+        let now = epoch_ms();
         let thread_id = format!("thread_{}", random_hex(12));
         let session_id = format!("ses_{}", random_hex(12));
-
-        let thread = Self::make_thread(&thread_id, &session_id);
-
-        self.index.upsert(HermesBinding {
+        let cwd = p.cwd.clone().unwrap_or_else(default_cwd);
+        let binding = HermesBinding {
             thread_id: thread_id.clone(),
-            hermes_session_id: session_id.clone(),
+            hermes_session_id: session_id,
             model: p.model.clone(),
-            created_at: epoch_ms(),
+            created_at: now,
+            updated_at: now,
             preview: None,
-        });
-
-        // Notify client that a thread started.
+            cwd: Some(cwd.clone()),
+            name: None,
+            forked_from_id: None,
+            archived: false,
+        };
+        self.index.upsert(binding.clone());
+        self.persist_index()?;
+        let thread = Self::binding_to_thread(&binding);
         let _ = ctx.notifier().send_notification(
             "thread/started",
             ThreadStartedNotification {
                 thread: thread.clone(),
             },
         );
-
-        let resp = ThreadStartResponse {
-            thread,
-            model: "hermes-agent".to_string(),
-            model_provider: "hermes-agent".to_string(),
-            service_tier: None,
-            cwd: "/tmp".to_string(),
-            instruction_sources: vec![],
-            approval_policy: AskForApproval::Never,
-            approvals_reviewer: ApprovalsReviewer::User,
-            sandbox: json!({"type": "danger-full-access"}),
-            permission_profile: None,
+        let base = Self::start_like_response(thread, p.model.clone());
+        to_value(ThreadStartResponse {
+            thread: base.thread,
+            model: base.model,
+            model_provider: base.model_provider,
+            service_tier: base.service_tier,
+            cwd,
+            instruction_sources: base.instruction_sources,
+            approval_policy: p.approval_policy.unwrap_or(AskForApproval::Never),
+            approvals_reviewer: p.approvals_reviewer.unwrap_or(ApprovalsReviewer::User),
+            sandbox: p
+                .sandbox
+                .map(|mode| match mode {
+                    SandboxMode::ReadOnly => json!({"type": "read-only"}),
+                    SandboxMode::WorkspaceWrite => json!({"type": "workspace-write"}),
+                    SandboxMode::DangerFullAccess => json!({"type": "danger-full-access"}),
+                })
+                .unwrap_or_else(|| json!({"type": "danger-full-access"})),
+            permission_profile: p.permission_profile,
             active_permission_profile: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
+        })
+    }
+
+    async fn handle_thread_resume(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
+        let p: ThreadResumeParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        let Some(mut binding) = self.index.get_by_thread(&p.thread_id) else {
+            return error_response(-32602, "thread not found");
         };
-        Ok(serde_json::to_value(resp).unwrap_or_default())
+        if let Some(cwd) = p.cwd.clone() {
+            binding.cwd = Some(cwd);
+            binding.updated_at = epoch_ms();
+            self.index.upsert(binding.clone());
+            self.persist_index()?;
+        }
+        let mut thread = Self::binding_to_thread(&binding);
+        if !p.exclude_turns {
+            thread.turns = self.logged_turns(&p.thread_id);
+        }
+        let _ = ctx.notifier().send_notification(
+            "thread/started",
+            ThreadStartedNotification {
+                thread: thread.clone(),
+            },
+        );
+        to_value(Self::start_like_response(thread, p.model.or(binding.model)))
     }
 
-    async fn handle_thread_resume(
-        &self,
-        _ctx: &Conn,
-        params: Value,
-    ) -> Result<Value, JsonRpcError> {
-        let _p: ThreadResumeParams = serde_json::from_value(params)
+    async fn handle_thread_fork(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
+        let p: ThreadForkParams = serde_json::from_value(params)
             .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-        // TODO: reconnect to existing Hermes session
-        error_response(-32603, "thread/resume not yet implemented")
-    }
-
-    async fn handle_thread_fork(&self, _ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let _p: ThreadForkParams = serde_json::from_value(params)
-            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-        error_response(-32603, "thread/fork not yet implemented")
+        let Some(parent) = self.index.get_by_thread(&p.thread_id) else {
+            return error_response(-32602, "thread not found");
+        };
+        let now = epoch_ms();
+        let thread_id = format!("thread_{}", random_hex(12));
+        let binding = HermesBinding {
+            thread_id: thread_id.clone(),
+            hermes_session_id: parent.hermes_session_id.clone(),
+            model: p.model.clone().or(parent.model.clone()),
+            created_at: now,
+            updated_at: now,
+            preview: parent.preview.clone(),
+            cwd: p.cwd.clone().or(parent.cwd.clone()),
+            name: parent.name.clone().map(|name| format!("{name} (fork)")),
+            forked_from_id: Some(parent.thread_id.clone()),
+            archived: false,
+        };
+        self.index.upsert(binding.clone());
+        self.persist_index()?;
+        let thread = Self::binding_to_thread(&binding);
+        let _ = ctx.notifier().send_notification(
+            "thread/started",
+            ThreadStartedNotification {
+                thread: thread.clone(),
+            },
+        );
+        to_value(ThreadForkResponse {
+            ..Self::start_like_response(thread, binding.model)
+        })
     }
 
     async fn handle_thread_archive(
         &self,
-        _ctx: &Conn,
+        ctx: &Conn,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let tid = params
-            .get("threadId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if let Some(b) = self.index.remove(tid) {
-            self.index.persist().ok();
-            let thread = Self::make_thread(&b.thread_id, &b.hermes_session_id);
-            let thread = Thread {
-                status: ThreadStatus::Idle,
-                ..thread
-            };
-            Ok(json!({ "thread": thread }))
-        } else {
-            error_response(-32602, "thread not found")
+        let p: ThreadArchiveParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        if self
+            .index
+            .set_archived(&p.thread_id, true, epoch_ms())
+            .is_none()
+        {
+            return error_response(-32602, "thread not found");
         }
+        self.persist_index()?;
+        let _ = ctx.notifier().send_notification(
+            "thread/archived",
+            ThreadIdOnly {
+                thread_id: p.thread_id,
+            },
+        );
+        to_value(ThreadArchiveResponse::default())
     }
 
     async fn handle_thread_unarchive(
         &self,
-        _ctx: &Conn,
-        _params: Value,
+        ctx: &Conn,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        let p: alleycat_codex_proto::thread::ThreadUnarchiveParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        let Some(binding) = self.index.set_archived(&p.thread_id, false, epoch_ms()) else {
+            return error_response(-32602, "thread not found");
+        };
+        self.persist_index()?;
+        let _ = ctx.notifier().send_notification(
+            "thread/unarchived",
+            ThreadIdOnly {
+                thread_id: p.thread_id.clone(),
+            },
+        );
+        to_value(alleycat_codex_proto::thread::ThreadUnarchiveResponse {
+            thread: Self::binding_to_thread(&binding),
+        })
     }
 
     async fn handle_thread_name_set(
         &self,
-        _ctx: &Conn,
-        _params: Value,
+        ctx: &Conn,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        let p: ThreadSetNameParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        if self
+            .index
+            .set_name(&p.thread_id, Some(p.name.clone()), epoch_ms())
+            .is_none()
+        {
+            return error_response(-32602, "thread not found");
+        }
+        self.persist_index()?;
+        let _ = ctx.notifier().send_notification(
+            "thread/name/updated",
+            ThreadNameUpdatedNotification {
+                thread_id: p.thread_id,
+                thread_name: Some(p.name),
+            },
+        );
+        to_value(ThreadSetNameResponse::default())
     }
 
     async fn handle_thread_compact_start(
@@ -343,31 +554,54 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        error_response(
+            -32601,
+            "thread/compact/start is not supported by Hermes bridge",
+        )
     }
 
     async fn handle_thread_rollback(
         &self,
         _ctx: &Conn,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        let _p: ThreadRollbackParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        error_response(-32601, "thread/rollback is not supported by Hermes bridge")
     }
 
     async fn handle_thread_list(&self, _ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let _p: ThreadListParams = serde_json::from_value(params)
+        let p: ThreadListParams = serde_json::from_value(params)
             .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-        let ids = self.index.thread_ids();
-        let threads: Vec<Thread> = ids
-            .iter()
-            .map(|id| Self::make_thread(id, "ses_unknown"))
-            .collect();
-        Ok(serde_json::to_value(ThreadListResponse {
+        let mut bindings = self.index.all();
+        if let Some(archived) = p.archived {
+            bindings.retain(|binding| binding.archived == archived);
+        } else {
+            bindings.retain(|binding| !binding.archived);
+        }
+        if let Some(term) = p.search_term.as_deref().filter(|s| !s.is_empty()) {
+            let needle = term.to_lowercase();
+            bindings.retain(|binding| {
+                binding
+                    .preview
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
+                    || binding
+                        .name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&needle)
+            });
+        }
+        let threads = bindings.iter().map(Self::binding_to_thread).collect();
+        to_value(ThreadListResponse {
             data: threads,
             next_cursor: None,
             backwards_cursor: None,
         })
-        .unwrap_or_default())
     }
 
     async fn handle_thread_loaded_list(
@@ -375,19 +609,22 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let ids = self.index.thread_ids();
-        Ok(json!({ "threadIds": ids }))
+        to_value(ThreadLoadedListResponse {
+            data: self.index.thread_ids(),
+            next_cursor: None,
+        })
     }
 
     async fn handle_thread_read(&self, _ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
-        let tid = params
-            .get("threadId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match self.index.get_by_thread(tid) {
-            Some(b) => {
-                let thread = Self::make_thread(&b.thread_id, &b.hermes_session_id);
-                Ok(json!({ "thread": thread }))
+        let p: ThreadReadParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        match self.index.get_by_thread(&p.thread_id) {
+            Some(binding) => {
+                let mut thread = Self::binding_to_thread(&binding);
+                if p.include_turns {
+                    thread.turns = self.logged_turns(&p.thread_id);
+                }
+                to_value(ThreadReadResponse { thread })
             }
             None => error_response(-32602, "thread not found"),
         }
@@ -396,9 +633,18 @@ impl HermesBridge {
     async fn handle_thread_turns_list(
         &self,
         _ctx: &Conn,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "turns": [] }))
+        let p: ThreadTurnsListParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        if self.index.get_by_thread(&p.thread_id).is_none() {
+            return error_response(-32602, "thread not found");
+        }
+        to_value(ThreadTurnsListResponse {
+            data: self.logged_turns(&p.thread_id),
+            next_cursor: None,
+            backwards_cursor: None,
+        })
     }
 
     async fn handle_thread_background_terminals_clean(
@@ -406,30 +652,22 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(ThreadBackgroundTerminalsCleanResponse::default())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Turn handlers
-// ---------------------------------------------------------------------------
 
 impl HermesBridge {
     async fn handle_turn_start(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
         let p: TurnStartParams = serde_json::from_value(params)
             .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-
         let thread_id = p.thread_id.clone();
         let turn_id = format!("turn_{}", random_hex(12));
-
-        // Resolve session from index.
         let binding = self
             .index
             .get_by_thread(&thread_id)
             .ok_or_else(|| rpc_error(-32602, "thread not found"))?;
         let session_id = binding.hermes_session_id.clone();
-
-        // Track the turn.
+        self.start_logged_turn(&thread_id, &turn_id);
         self.state.insert(
             thread_id.clone(),
             ActiveTurn {
@@ -439,8 +677,6 @@ impl HermesBridge {
                 run_id: None,
             },
         );
-
-        // Notify turn started.
         let turn = Turn {
             id: turn_id.clone(),
             items: vec![],
@@ -455,38 +691,22 @@ impl HermesBridge {
             "turn/started",
             TurnStartedNotification {
                 thread_id: thread_id.clone(),
-                turn: turn.clone(),
+                turn,
             },
         );
-
-        // Emit the user message as an item.
-        let user_item_id = format!("item_{}", random_hex(8));
-        let _ = ctx.notifier().send_notification(
-            "item/started",
-            ItemStartedNotification {
-                item: ThreadItem::UserMessage {
-                    id: user_item_id.clone(),
-                    content: p.input.clone(),
-                },
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                parent_item_id: None,
-            },
+        self.emit_user_message(ctx, &thread_id, &turn_id, &p.input)
+            .await;
+        let text = user_text(&p.input);
+        let cwd = p.cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+        self.index.update_after_turn(
+            &thread_id,
+            None,
+            p.model.clone(),
+            preview_for(&text),
+            cwd,
+            epoch_ms(),
         );
-        let _ = ctx.notifier().send_notification(
-            "item/completed",
-            ItemCompletedNotification {
-                item: ThreadItem::UserMessage {
-                    id: user_item_id.clone(),
-                    content: p.input.clone(),
-                },
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                parent_item_id: None,
-            },
-        );
-
-        // Dispatch turn to Hermes backend.
+        self.persist_index()?;
         match &self.config.mode {
             crate::config::HermesMode::Api { .. } => {
                 self.dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &p)
@@ -518,7 +738,6 @@ impl HermesBridge {
     }
 
     async fn handle_turn_steer(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        // Steer is not supported — returns empty for now.
         Ok(json!({}))
     }
 
@@ -527,16 +746,15 @@ impl HermesBridge {
         _ctx: &Conn,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let thread_id = params
-            .get("threadId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if let Some(active) = self.state.remove(thread_id)
-            && let Some(run_id) = active.run_id
+        let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+        if let Some(active) = self
+            .state
+            .remove(thread_id)
+            .and_then(|active| active.run_id)
         {
-            let _ = self.api_client.stop_run(&run_id).await;
+            let _ = self.api_client.stop_run(&active).await;
         }
-        Ok(json!({}))
+        to_value(TurnInterruptResponse::default())
     }
 
     async fn handle_review_start(
@@ -544,17 +762,16 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        error_response(-32601, "review/start not supported")
+        error_response(
+            -32601,
+            "review/start is not supported by the Hermes backend",
+        )
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model / Account / Config stubs
-// ---------------------------------------------------------------------------
-
 impl HermesBridge {
     async fn handle_model_list(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        let resp = ModelListResponse {
+        to_value(ModelListResponse {
             data: vec![alleycat_codex_proto::model::Model {
                 id: "hermes-agent".to_string(),
                 model: "hermes-agent".to_string(),
@@ -578,8 +795,7 @@ impl HermesBridge {
                 is_default: true,
             }],
             next_cursor: None,
-        };
-        Ok(serde_json::to_value(resp).unwrap_or_default())
+        })
     }
 
     async fn handle_account_read(
@@ -587,7 +803,10 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "account": null, "requiresOpenaiAuth": false }))
+        to_value(GetAccountResponse {
+            account: Some(Account::ApiKey {}),
+            requires_openai_auth: false,
+        })
     }
 
     async fn handle_account_rate_limits_read(
@@ -595,7 +814,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "rateLimits": {}, "rateLimitsByLimitId": null }))
+        to_value(GetAccountRateLimitsResponse::default())
     }
 
     async fn handle_account_login_start(
@@ -603,7 +822,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(LoginAccountResponse::ApiKey {})
     }
 
     async fn handle_account_login_cancel(
@@ -611,7 +830,9 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(CancelLoginAccountResponse {
+            status: CancelLoginAccountStatus::NotFound,
+        })
     }
 
     async fn handle_account_logout(
@@ -619,27 +840,51 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(LogoutAccountResponse::default())
     }
 
     async fn handle_config_read(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(ConfigReadResponse {
+            config: json!({"model_provider": "hermes-agent", "model": "hermes-agent"}),
+            origins: Default::default(),
+            layers: None,
+        })
     }
 
     async fn handle_config_value_write(
         &self,
         _ctx: &Conn,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        let file_path = params
+            .get("filePath")
+            .and_then(Value::as_str)
+            .unwrap_or("hermes-bridge")
+            .to_string();
+        to_value(ConfigWriteResponse {
+            status: WriteStatus::Ok,
+            version: epoch_ms().to_string(),
+            file_path,
+            overridden_metadata: None,
+        })
     }
 
     async fn handle_config_batch_write(
         &self,
         _ctx: &Conn,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        let file_path = params
+            .get("filePath")
+            .and_then(Value::as_str)
+            .unwrap_or("hermes-bridge")
+            .to_string();
+        to_value(ConfigWriteResponse {
+            status: WriteStatus::Ok,
+            version: epoch_ms().to_string(),
+            file_path,
+            overridden_metadata: None,
+        })
     }
 
     async fn handle_config_requirements_read(
@@ -647,7 +892,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(ConfigRequirementsReadResponse::default())
     }
 
     async fn handle_mcp_server_status_list(
@@ -655,7 +900,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "servers": [] }))
+        to_value(ListMcpServerStatusResponse::default())
     }
 
     async fn handle_config_mcp_server_reload(
@@ -663,7 +908,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(McpServerRefreshResponse::default())
     }
 
     async fn handle_mcp_server_oauth_login(
@@ -671,11 +916,13 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(McpServerOauthLoginResponse {
+            authorization_url: String::new(),
+        })
     }
 
     async fn handle_skills_list(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "skills": [] }))
+        to_value(SkillsListResponse { data: vec![] })
     }
 
     async fn handle_skills_remote_list(
@@ -683,7 +930,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "skills": [] }))
+        to_value(SkillsListResponse { data: vec![] })
     }
 
     async fn handle_skills_remote_export(
@@ -697,17 +944,73 @@ impl HermesBridge {
     async fn handle_skills_config_write(
         &self,
         _ctx: &Conn,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(SkillsConfigWriteResponse {
+            effective_enabled: params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        })
     }
 
-    async fn handle_command_exec(
-        &self,
-        _ctx: &Conn,
-        _params: Value,
-    ) -> Result<Value, JsonRpcError> {
-        error_response(-32601, "command/exec not supported by hermes bridge")
+    async fn handle_command_exec(&self, _ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
+        let p: CommandExecParams = serde_json::from_value(params)
+            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
+        if p.command.is_empty() {
+            return error_response(-32602, "command/exec requires a non-empty command");
+        }
+        if p.tty || p.stream_stdin || p.stream_stdout_stderr || p.process_id.is_some() {
+            return error_response(
+                -32602,
+                "command/exec streaming and TTY modes are not supported by the Hermes bridge; use buffered exec",
+            );
+        }
+
+        let mut cmd = Command::new(&p.command[0]);
+        cmd.args(&p.command[1..]);
+        if let Some(cwd) = p.cwd {
+            cmd.current_dir(cwd);
+        }
+        if let Some(env) = p.env {
+            for (key, value) in env {
+                match value {
+                    Some(value) => {
+                        cmd.env(key, value);
+                    }
+                    None => {
+                        cmd.env_remove(key);
+                    }
+                }
+            }
+        }
+
+        let timeout_ms = if p.disable_timeout {
+            None
+        } else {
+            Some(p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000) as u64)
+        };
+        let output_result = if let Some(timeout_ms) = timeout_ms {
+            tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
+                .await
+                .map_err(|_| rpc_error(-32603, "command/exec timed out"))?
+        } else {
+            cmd.output().await
+        };
+        let output = output_result
+            .map_err(|e| rpc_error(-32603, format!("command/exec failed to spawn: {e}")))?;
+        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !p.disable_output_cap {
+            let cap = p.output_bytes_cap.unwrap_or(1_048_576);
+            truncate_string(&mut stdout, cap);
+            truncate_string(&mut stderr, cap);
+        }
+        to_value(CommandExecResponse {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        })
     }
 
     async fn handle_command_exec_write(
@@ -715,7 +1018,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        error_response(-32601, "command/exec/write not supported by hermes bridge")
+        to_value(CommandExecWriteResponse::default())
     }
 
     async fn handle_command_exec_terminate(
@@ -723,10 +1026,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        error_response(
-            -32601,
-            "command/exec/terminate not supported by hermes bridge",
-        )
+        to_value(CommandExecTerminateResponse::default())
     }
 
     async fn handle_command_exec_resize(
@@ -734,7 +1034,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        error_response(-32601, "command/exec/resize not supported by hermes bridge")
+        to_value(CommandExecResizeResponse::default())
     }
 
     async fn handle_mock_experimental_method(
@@ -750,7 +1050,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "features": [] }))
+        Ok(json!({ "data": [], "nextCursor": null }))
     }
 
     async fn handle_collaboration_mode_list(
@@ -758,7 +1058,7 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({ "modes": [] }))
+        Ok(json!({ "data": [] }))
     }
 
     async fn handle_feedback_upload(
@@ -766,13 +1066,9 @@ impl HermesBridge {
         _ctx: &Conn,
         _params: Value,
     ) -> Result<Value, JsonRpcError> {
-        Ok(json!({}))
+        to_value(alleycat_codex_proto::account::FeedbackUploadResponse::default())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Turn dispatch — API mode
-// ---------------------------------------------------------------------------
 
 impl HermesBridge {
     async fn dispatch_turn_api(
@@ -780,119 +1076,111 @@ impl HermesBridge {
         ctx: &Conn,
         thread_id: &str,
         turn_id: &str,
-        _session_id: &str,
+        session_id: &str,
         params: &TurnStartParams,
     ) -> Result<Value, JsonRpcError> {
-        // Extract user text from TurnStartParams.input
-        let user_text: String = params
-            .input
-            .iter()
-            .filter_map(|inp| match inp {
-                UserInput::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<&str>>()
-            .join("\n");
-
+        let text = user_text(&params.input);
         let request = CreateRunRequest {
-            input: user_text,
-            session_id: Some(_session_id.to_string()),
+            input: text,
+            session_id: Some(session_id.to_string()),
             cwd: params.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
             model: params.model.clone(),
         };
-        match self.api_client.create_run(request).await {
-            Ok(run) => {
-                if let Some(ref hermes_session_id) = run.session_id {
-                    self.index.upsert(HermesBinding {
-                        thread_id: thread_id.to_string(),
-                        hermes_session_id: hermes_session_id.clone(),
-                        model: params.model.clone(),
-                        created_at: epoch_ms(),
-                        preview: None,
-                    });
-                }
-                self.state.insert(
-                    thread_id.to_string(),
-                    ActiveTurn {
-                        turn_id: turn_id.to_string(),
-                        thread_id: thread_id.to_string(),
-                        hermes_session_id: _session_id.to_string(),
-                        run_id: Some(run.run_id.clone()),
-                    },
-                );
-                let mut text = String::new();
-                match self.api_client.events_stream(&run.run_id).await {
-                    Ok(resp) => {
-                        let mut body = String::new();
-                        let mut stream = resp.bytes_stream();
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(bytes) => {
-                                    body.push_str(&String::from_utf8_lossy(&bytes));
-                                    let split_at = body.rfind(
-                                        "
+        let run = self
+            .api_client
+            .create_run(request)
+            .await
+            .map_err(|e| rpc_error(-32603, format!("Hermes API error: {e}")))?;
+        if let Some(ref hermes_session_id) = run.session_id {
+            self.index.update_after_turn(
+                thread_id,
+                Some(hermes_session_id.clone()),
+                params.model.clone(),
+                None,
+                None,
+                epoch_ms(),
+            );
+            self.persist_index()?;
+        }
+        self.state.insert(
+            thread_id.to_string(),
+            ActiveTurn {
+                turn_id: turn_id.to_string(),
+                thread_id: thread_id.to_string(),
+                hermes_session_id: session_id.to_string(),
+                run_id: Some(run.run_id.clone()),
+            },
+        );
 
-",
-                                    );
-                                    if let Some(idx) = split_at {
-                                        let complete = body[..idx + 2].to_string();
-                                        body = body[idx + 2..].to_string();
-                                        for event in crate::sse::parse_sse_frames(&complete) {
-                                            if let Some(delta) = event.message_delta() {
-                                                text.push_str(&delta);
-                                                self.emit_agent_delta(
-                                                    ctx, thread_id, turn_id, &delta,
-                                                )
-                                                .await;
-                                            } else if let Some(error) = event.terminal_error() {
-                                                return error_response(
-                                                    -32603,
-                                                    &format!("Hermes API error: {error}"),
-                                                );
-                                            } else if event.is_terminal_success() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    return error_response(
-                                        -32603,
-                                        &format!("Hermes SSE error: {e}"),
-                                    );
-                                }
-                            }
-                        }
-                        if !body.trim().is_empty() {
-                            for event in crate::sse::parse_sse_frames(&body) {
-                                if let Some(delta) = event.message_delta() {
-                                    text.push_str(&delta);
-                                    self.emit_agent_delta(ctx, thread_id, turn_id, &delta).await;
-                                }
-                            }
-                        }
+        let agent_item_id = format!("item_{}", random_hex(8));
+        self.emit_agent_started(ctx, thread_id, turn_id, &agent_item_id)
+            .await;
+        let mut full_text = String::new();
+        let mut terminal = false;
+        let resp = self
+            .api_client
+            .events_stream(&run.run_id)
+            .await
+            .map_err(|e| rpc_error(-32603, format!("Hermes events error: {e}")))?;
+        let mut body = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| rpc_error(-32603, format!("Hermes SSE error: {e}")))?;
+            body.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(idx) = body.find("\n\n") {
+                let complete = body[..idx + 2].to_string();
+                body = body[idx + 2..].to_string();
+                for event in crate::sse::parse_sse_frames(&complete) {
+                    if let Some(delta) = event.message_delta() {
+                        full_text.push_str(&delta);
+                        self.emit_agent_delta(ctx, thread_id, turn_id, &agent_item_id, &delta)
+                            .await;
+                    } else if let Some(error) = event.terminal_error() {
+                        self.emit_agent_completed(
+                            ctx,
+                            thread_id,
+                            turn_id,
+                            &agent_item_id,
+                            &full_text,
+                        )
+                        .await;
+                        self.emit_turn_completed(
+                            ctx,
+                            thread_id,
+                            turn_id,
+                            None,
+                            Some(format!("Hermes API error: {error}")),
+                        )
+                        .await;
+                        return error_response(-32603, &format!("Hermes API error: {error}"));
+                    } else if event.is_terminal_success() {
+                        terminal = true;
                     }
-                    Err(e) => return error_response(-32603, &format!("Hermes events error: {e}")),
                 }
-                self.emit_turn_completed(ctx, thread_id, turn_id, Some(&text), None)
-                    .await;
-                let resp = TurnStartResponse {
-                    turn: completed_turn(turn_id),
-                };
-                Ok(serde_json::to_value(resp).unwrap_or_default())
+                if terminal {
+                    break;
+                }
             }
-            Err(e) => {
-                self.emit_turn_completed(
-                    ctx,
-                    thread_id,
-                    turn_id,
-                    None,
-                    Some(format!("Hermes API error: {e}")),
-                )
-                .await;
-                error_response(-32603, &format!("Hermes API error: {e}"))
+            if terminal {
+                break;
             }
         }
+        if !terminal && !body.trim().is_empty() {
+            for event in crate::sse::parse_sse_frames(&body) {
+                if let Some(delta) = event.message_delta() {
+                    full_text.push_str(&delta);
+                    self.emit_agent_delta(ctx, thread_id, turn_id, &agent_item_id, &delta)
+                        .await;
+                }
+            }
+        }
+        self.emit_agent_completed(ctx, thread_id, turn_id, &agent_item_id, &full_text)
+            .await;
+        self.emit_turn_completed(ctx, thread_id, turn_id, Some(&full_text), None)
+            .await;
+        to_value(TurnStartResponse {
+            turn: completed_turn(turn_id),
+        })
     }
 
     async fn dispatch_turn_cli(
@@ -902,16 +1190,7 @@ impl HermesBridge {
         turn_id: &str,
         params: &TurnStartParams,
     ) -> Result<Value, JsonRpcError> {
-        let user_text: String = params
-            .input
-            .iter()
-            .filter_map(|inp| match inp {
-                UserInput::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<&str>>()
-            .join("\n");
-
+        let text = user_text(&params.input);
         let (bin, session_id) = match &self.config.mode {
             crate::config::HermesMode::Cli { bin }
             | crate::config::HermesMode::Auto { bin, .. } => (
@@ -922,56 +1201,118 @@ impl HermesBridge {
             ),
             crate::config::HermesMode::Api { .. } => ("hermes".to_string(), None),
         };
-        match crate::cli_adapter::run_hermes_cli(&bin, &user_text, session_id.as_deref(), None)
-            .await
-        {
-            Ok(text) => {
-                self.emit_synthetic_completion(ctx, thread_id, turn_id, &text)
+        match crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), None).await {
+            Ok(output) => {
+                self.emit_synthetic_completion(ctx, thread_id, turn_id, &output)
                     .await;
-                let resp = TurnStartResponse {
+                to_value(TurnStartResponse {
                     turn: completed_turn(turn_id),
-                };
-                Ok(serde_json::to_value(resp).unwrap_or_default())
+                })
             }
-            Err(e) => error_response(-32603, &format!("Hermes CLI error: {e}")),
+            Err(e) => {
+                self.emit_turn_completed(
+                    ctx,
+                    thread_id,
+                    turn_id,
+                    None,
+                    Some(format!("Hermes CLI error: {e}")),
+                )
+                .await;
+                error_response(-32603, &format!("Hermes CLI error: {e}"))
+            }
         }
     }
 
-    async fn emit_agent_delta(&self, ctx: &Conn, thread_id: &str, turn_id: &str, text: &str) {
+    async fn emit_user_message(
+        &self,
+        ctx: &Conn,
+        thread_id: &str,
+        turn_id: &str,
+        input: &[UserInput],
+    ) {
         let item_id = format!("item_{}", random_hex(8));
+        let item = ThreadItem::UserMessage {
+            id: item_id,
+            content: input.to_vec(),
+        };
+        self.push_logged_item(thread_id, turn_id, item.clone());
         let _ = ctx.notifier().send_notification(
             "item/started",
             ItemStartedNotification {
-                item: ThreadItem::AgentMessage {
-                    id: item_id.clone(),
-                    text: String::new(),
-                    phase: None,
-                    memory_citation: None,
-                },
+                item: item.clone(),
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
-                parent_item_id: None,
-            },
-        );
-        let _ = ctx.notifier().send_notification(
-            "item/agentMessage/delta",
-            AgentMessageDeltaNotification {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                item_id: item_id.clone(),
-                delta: text.to_string(),
                 parent_item_id: None,
             },
         );
         let _ = ctx.notifier().send_notification(
             "item/completed",
             ItemCompletedNotification {
-                item: ThreadItem::AgentMessage {
-                    id: item_id,
-                    text: text.to_string(),
-                    phase: None,
-                    memory_citation: None,
-                },
+                item,
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                parent_item_id: None,
+            },
+        );
+    }
+
+    async fn emit_agent_started(&self, ctx: &Conn, thread_id: &str, turn_id: &str, item_id: &str) {
+        let item = ThreadItem::AgentMessage {
+            id: item_id.to_string(),
+            text: String::new(),
+            phase: None,
+            memory_citation: None,
+        };
+        let _ = ctx.notifier().send_notification(
+            "item/started",
+            ItemStartedNotification {
+                item,
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                parent_item_id: None,
+            },
+        );
+    }
+
+    async fn emit_agent_delta(
+        &self,
+        ctx: &Conn,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        delta: &str,
+    ) {
+        let _ = ctx.notifier().send_notification(
+            "item/agentMessage/delta",
+            AgentMessageDeltaNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: item_id.to_string(),
+                delta: delta.to_string(),
+                parent_item_id: None,
+            },
+        );
+    }
+
+    async fn emit_agent_completed(
+        &self,
+        ctx: &Conn,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        text: &str,
+    ) {
+        let item = ThreadItem::AgentMessage {
+            id: item_id.to_string(),
+            text: text.to_string(),
+            phase: None,
+            memory_citation: None,
+        };
+        self.push_logged_item(thread_id, turn_id, item.clone());
+        let _ = ctx.notifier().send_notification(
+            "item/completed",
+            ItemCompletedNotification {
+                item,
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
                 parent_item_id: None,
@@ -997,15 +1338,18 @@ impl HermesBridge {
             items: vec![],
             items_view: "full".to_string(),
             status,
-            error: error.map(|message| alleycat_codex_proto::common::TurnError {
-                message,
-                codex_error_info: None,
-                additional_details: None,
-            }),
+            error: error
+                .clone()
+                .map(|message| alleycat_codex_proto::common::TurnError {
+                    message,
+                    codex_error_info: None,
+                    additional_details: None,
+                }),
             started_at: Some(epoch_ms()),
             completed_at: Some(epoch_ms()),
             duration_ms: None,
         };
+        self.complete_logged_turn(thread_id, turn_id, error);
         let _ = ctx.notifier().send_notification(
             "turn/completed",
             TurnCompletedNotification {
@@ -1016,7 +1360,6 @@ impl HermesBridge {
         self.state.remove(thread_id);
     }
 
-    /// Emit a synthetic agent-message + turn-completed sequence.
     async fn emit_synthetic_completion(
         &self,
         ctx: &Conn,
@@ -1024,68 +1367,14 @@ impl HermesBridge {
         turn_id: &str,
         text: &str,
     ) {
-        let agent_item_id = format!("item_{}", random_hex(8));
-
-        let _ = ctx.notifier().send_notification(
-            "item/started",
-            ItemStartedNotification {
-                item: ThreadItem::AgentMessage {
-                    id: agent_item_id.clone(),
-                    text: String::new(),
-                    phase: None,
-                    memory_citation: None,
-                },
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                parent_item_id: None,
-            },
-        );
-
-        let _ = ctx.notifier().send_notification(
-            "item/agentMessage/delta",
-            AgentMessageDeltaNotification {
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                item_id: agent_item_id.clone(),
-                delta: text.to_string(),
-                parent_item_id: None,
-            },
-        );
-
-        let _ = ctx.notifier().send_notification(
-            "item/completed",
-            ItemCompletedNotification {
-                item: ThreadItem::AgentMessage {
-                    id: agent_item_id.clone(),
-                    text: text.to_string(),
-                    phase: None,
-                    memory_citation: None,
-                },
-                thread_id: thread_id.to_string(),
-                turn_id: turn_id.to_string(),
-                parent_item_id: None,
-            },
-        );
-
-        // End the turn.
-        let turn = Turn {
-            id: turn_id.to_string(),
-            items: vec![],
-            items_view: "full".to_string(),
-            status: TurnStatus::Completed,
-            error: None,
-            started_at: Some(epoch_ms()),
-            completed_at: Some(epoch_ms()),
-            duration_ms: None,
-        };
-        let _ = ctx.notifier().send_notification(
-            "turn/completed",
-            TurnCompletedNotification {
-                thread_id: thread_id.to_string(),
-                turn,
-            },
-        );
-
-        self.state.remove(thread_id);
+        let item_id = format!("item_{}", random_hex(8));
+        self.emit_agent_started(ctx, thread_id, turn_id, &item_id)
+            .await;
+        self.emit_agent_delta(ctx, thread_id, turn_id, &item_id, text)
+            .await;
+        self.emit_agent_completed(ctx, thread_id, turn_id, &item_id, text)
+            .await;
+        self.emit_turn_completed(ctx, thread_id, turn_id, Some(text), None)
+            .await;
     }
 }
