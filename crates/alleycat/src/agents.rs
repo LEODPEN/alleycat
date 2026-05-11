@@ -304,6 +304,37 @@ impl AgentManager {
         }
     }
 
+    pub async fn restart_agent(&self, agent: &str) -> anyhow::Result<()> {
+        match agent {
+            "codex" => self.restart_codex().await,
+            other => Err(anyhow!("restart is not supported for agent `{}`", other)),
+        }
+    }
+
+    async fn restart_codex(&self) -> anyhow::Result<()> {
+        let mut guard = self.codex_child.lock().await;
+        if let Some(mut child) = guard.take() {
+            child
+                .kill()
+                .await
+                .context("stopping codex app-server child")?;
+            let _ = child.wait().await;
+            info!("codex app-server child stopped");
+            return Ok(());
+        }
+
+        let (host, port) = {
+            let cfg = self.config.load();
+            (cfg.agents.codex.host.clone(), cfg.agents.codex.port)
+        };
+        if TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            return Err(anyhow!(
+                "codex app-server on {host}:{port} is not owned by this daemon"
+            ));
+        }
+        Ok(())
+    }
+
     async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
         match self.codex_mode {
             CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,

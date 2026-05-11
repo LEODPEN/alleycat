@@ -148,6 +148,25 @@ async fn handle_stream(
             write_json_frame(&mut send, &Response::agents(list)).await?;
             Ok(())
         }
+        Request::RestartAgent { agent, .. } => {
+            info!(conn = conn, %agent, "restart_agent");
+            if !agents.agent_enabled(&agent) {
+                warn!(conn = conn, %agent, "rejecting restart: agent disabled or unknown");
+                write_json_frame(
+                    &mut send,
+                    &Response::error(format!("agent `{agent}` is disabled or unknown")),
+                )
+                .await?;
+                return Err(anyhow!("agent disabled or unknown: {agent}"));
+            }
+            if let Err(error) = agents.restart_agent(&agent).await {
+                warn!(conn = conn, %agent, "restart_agent failed: {error:#}");
+                write_json_frame(&mut send, &Response::error(error.to_string())).await?;
+                return Err(error);
+            }
+            write_json_frame(&mut send, &Response::ok()).await?;
+            Ok(())
+        }
         Request::Connect { agent, resume, .. } => {
             if !agents.agent_enabled(&agent) {
                 warn!(conn = conn, %agent, "rejecting: agent disabled or unknown");

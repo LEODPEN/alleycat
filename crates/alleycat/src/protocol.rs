@@ -87,6 +87,11 @@ pub enum Request {
         v: u32,
         token: String,
     },
+    RestartAgent {
+        v: u32,
+        token: String,
+        agent: String,
+    },
     Connect {
         v: u32,
         token: String,
@@ -99,13 +104,17 @@ pub enum Request {
 impl Request {
     pub fn version(&self) -> u32 {
         match self {
-            Self::ListAgents { v, .. } | Self::Connect { v, .. } => *v,
+            Self::ListAgents { v, .. } | Self::RestartAgent { v, .. } | Self::Connect { v, .. } => {
+                *v
+            }
         }
     }
 
     pub fn token(&self) -> &str {
         match self {
-            Self::ListAgents { token, .. } | Self::Connect { token, .. } => token,
+            Self::ListAgents { token, .. }
+            | Self::RestartAgent { token, .. }
+            | Self::Connect { token, .. } => token,
         }
     }
 }
@@ -123,6 +132,16 @@ pub struct Response {
 }
 
 impl Response {
+    pub fn ok() -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            ok: true,
+            agents: None,
+            session: None,
+            error: None,
+        }
+    }
+
     pub fn ok_with_session(session: SessionInfo) -> Self {
         Self {
             v: PROTOCOL_VERSION,
