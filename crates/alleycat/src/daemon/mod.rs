@@ -189,7 +189,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
         pid: std::process::id(),
         node_id: daemon.node_id.clone(),
         token_short: token_fingerprint(&cfg.token),
-        relay: cfg.relay.clone(),
+        relay: host::endpoint_home_relay(Some(&daemon.endpoint)).or_else(|| cfg.relay.clone()),
         config_path: paths::host_config_file()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string()),

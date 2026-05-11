@@ -200,8 +200,9 @@ async fn async_main() -> anyhow::Result<()> {
 fn init_cli_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,alleycat=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("warn,alleycat=info,iroh=error,noq=error,noq_udp=error,quinn=error")
+            }),
         )
         .with_writer(std::io::stderr)
         .try_init();

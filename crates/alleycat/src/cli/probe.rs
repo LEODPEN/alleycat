@@ -18,13 +18,15 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use clap::Args;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, PublicKey, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::cli;
+use crate::daemon::control::Request as ControlRequest;
 use crate::framing::{read_json_frame, write_json_frame};
 use crate::host;
-use crate::protocol::{ALLEYCAT_ALPN, PROTOCOL_VERSION, Request, Response};
+use crate::protocol::{ALLEYCAT_ALPN, PROTOCOL_VERSION, PairPayload, Request, Response};
 
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
@@ -47,6 +49,10 @@ pub struct ProbeArgs {
     /// from `host.toml`). Pair this with `--node-id` to probe a remote.
     #[arg(long)]
     pub token: Option<String>,
+    /// Override the relay URL. By default local probes use the daemon's live
+    /// pair payload relay, matching the QR path used by mobile clients.
+    #[arg(long)]
+    pub relay: Option<String>,
     /// How long to wait for additional JSON-RPC frames after the method
     /// response before exiting, in seconds. Streaming methods may push
     /// notifications; raise this to capture them.
@@ -58,41 +64,94 @@ pub struct ProbeArgs {
 }
 
 pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
+    if args.node_id.is_none() {
+        cli::ensure_current_daemon().await?;
+    }
+
     let cfg = crate::config::load_or_init().await?;
     let server_secret = crate::state::load_or_create_secret_key().await?;
+    let local_payload = load_local_pair_payload(&server_secret, &cfg, args.node_id.is_none()).await;
 
     let token = match &args.token {
         Some(t) => t.clone(),
-        None => cfg.token.clone(),
+        None => local_payload.token.clone(),
     };
     let node_id: PublicKey = match &args.node_id {
         Some(s) => s
             .parse()
             .with_context(|| format!("parsing --node-id {s:?} as iroh public key"))?,
-        None => server_secret.public(),
+        None => local_payload
+            .node_id
+            .parse()
+            .with_context(|| format!("parsing pair payload node_id {:?}", local_payload.node_id))?,
+    };
+    let relay = match (&args.relay, &args.node_id) {
+        (Some(relay), _) => Some(relay.clone()),
+        (None, None) => local_payload.relay.clone(),
+        (None, Some(_)) => None,
     };
 
-    let payload = host::pair_payload(&server_secret, &cfg, None);
     eprintln!(
         "probe: dialing node_id={} token={} relay={}",
         node_id,
         short_token(&token),
-        payload.relay.as_deref().unwrap_or("<iroh default>")
+        relay.as_deref().unwrap_or("<iroh default>")
     );
 
     let endpoint = build_client_endpoint().await?;
+    let result = probe_with_endpoint(&endpoint, node_id, relay.as_deref(), &token, &args).await;
+    endpoint.close().await;
+    result
+}
+
+async fn load_local_pair_payload(
+    server_secret: &SecretKey,
+    cfg: &crate::config::HostConfig,
+    prefer_daemon: bool,
+) -> PairPayload {
+    if prefer_daemon
+        && let Ok(resp) = cli::send(ControlRequest::Pair).await
+        && let Ok(payload) = cli::decode_data::<PairPayload>(resp)
+    {
+        return payload;
+    }
+
+    host::pair_payload(server_secret, cfg, None)
+}
+
+async fn probe_with_endpoint(
+    endpoint: &Endpoint,
+    node_id: PublicKey,
+    relay: Option<&str>,
+    token: &str,
+    args: &ProbeArgs,
+) -> anyhow::Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(8), endpoint.online()).await;
 
+    let addr = endpoint_addr(node_id, relay)?;
     let conn = endpoint
-        .connect(node_id, ALLEYCAT_ALPN)
+        .connect(addr, ALLEYCAT_ALPN)
         .await
         .with_context(|| format!("dialing alleycat node {node_id}"))?;
     eprintln!("probe: iroh connection established");
 
-    match args.agent.as_deref() {
-        None => list_agents(&conn, &token).await,
-        Some(agent) => probe_agent(&conn, &token, agent, &args).await,
+    let result = match args.agent.as_deref() {
+        None => list_agents(&conn, token).await,
+        Some(agent) => probe_agent(&conn, token, agent, args).await,
+    };
+    conn.close(iroh::endpoint::VarInt::from_u32(0), b"probe complete");
+    result
+}
+
+fn endpoint_addr(node_id: PublicKey, relay: Option<&str>) -> anyhow::Result<EndpointAddr> {
+    let mut addr = EndpointAddr::new(node_id);
+    if let Some(relay) = relay {
+        let relay_url = relay
+            .parse()
+            .with_context(|| format!("parsing relay URL {relay:?}"))?;
+        addr = addr.with_relay_url(relay_url);
     }
+    Ok(addr)
 }
 
 async fn list_agents(conn: &iroh::endpoint::Connection, token: &str) -> anyhow::Result<()> {

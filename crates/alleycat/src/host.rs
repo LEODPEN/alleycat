@@ -233,7 +233,7 @@ pub fn pair_payload(
 /// Read the iroh endpoint's currently-known home relay, if any. Pair payloads
 /// prefer this over the static config so phones can dial the host even when
 /// pkarr/DNS publishing is broken (e.g. IPv6-only relays + Tailscale).
-fn endpoint_home_relay(endpoint: Option<&Endpoint>) -> Option<String> {
+pub fn endpoint_home_relay(endpoint: Option<&Endpoint>) -> Option<String> {
     endpoint?
         .addr()
         .relay_urls()
