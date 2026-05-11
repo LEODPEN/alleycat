@@ -97,7 +97,10 @@ pub fn binary_version() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Iroh-backed bridge that multiplexes local coding agents for paired clients")]
+#[command(
+    version,
+    about = "Iroh-backed bridge that multiplexes local coding agents for paired clients"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -126,6 +129,8 @@ enum Command {
     Stop,
     /// Reload `host.toml` live in the running daemon.
     Reload,
+    /// Restart the daemon from this binary.
+    Restart,
     /// Inspect agents.
     Agents(cli::agents::AgentsArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
@@ -182,6 +187,12 @@ async fn async_main() -> anyhow::Result<()> {
             init_cli_logging();
             cli::reload::run().await
         }
+        Some(Command::Restart) => {
+            init_cli_logging();
+            cli::restart_daemon().await?;
+            println!("daemon restarted.");
+            Ok(())
+        }
         Some(Command::Agents(args)) => {
             init_cli_logging();
             cli::agents::run(args).await
@@ -199,11 +210,9 @@ async fn async_main() -> anyhow::Result<()> {
 
 fn init_cli_logging() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new("warn,alleycat=info,iroh=error,noq=error,noq_udp=error,quinn=error")
-            }),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("warn,alleycat=info,iroh=error,noq=error,noq_udp=error,quinn=error")
+        }))
         .with_writer(std::io::stderr)
         .try_init();
 }
