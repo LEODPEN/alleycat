@@ -25,6 +25,7 @@ alleycat-amp-bridge = { workspace = true }
 alleycat-bridge-core = { workspace = true }
 alleycat-claude-bridge = { workspace = true }
 alleycat-droid-bridge = { workspace = true }
+alleycat-hermes-bridge = { workspace = true }
 alleycat-opencode-bridge = { workspace = true }
 alleycat-pi-bridge = { workspace = true }
 anyhow.workspace = true
@@ -38,6 +39,7 @@ hostname.workspace = true
 iroh.workspace = true
 qrcodegen = "1"
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
