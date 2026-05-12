@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
+use crate::agent_manifest::{MANIFESTS, manifest_for};
 use crate::config::HostConfig;
 use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
@@ -213,53 +214,46 @@ impl AgentManager {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        vec![
-            AgentInfo {
-                name: "codex".to_string(),
-                display_name: "Codex".to_string(),
-                wire: match self.codex_mode {
+        // Availability is computed per-agent (some are async, some not),
+        // then each manifest is rendered to the wire `AgentInfo` shape.
+        let mut out = Vec::with_capacity(MANIFESTS.len());
+        for manifest in MANIFESTS {
+            let available = match manifest.name {
+                "codex" => self.codex_available(),
+                "pi" => self.pi_available(),
+                "amp" => self.amp_available(),
+                "opencode" => self.opencode_available(),
+                "claude" => self.claude_available(),
+                "droid" => self.droid_available(),
+                "hermes" => self.hermes_available().await,
+                _ => false,
+            };
+            let wire = if manifest.name == "codex" {
+                match self.codex_mode {
                     CodexMode::Websocket => AgentWire::Websocket,
                     CodexMode::Stdio => AgentWire::Jsonl,
-                },
-                available: self.codex_available(),
-            },
-            AgentInfo {
-                name: "pi".to_string(),
-                display_name: "Pi".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.pi_available(),
-            },
-            AgentInfo {
-                name: "amp".to_string(),
-                display_name: "Amp".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.amp_available(),
-            },
-            AgentInfo {
-                name: "opencode".to_string(),
-                display_name: "OpenCode".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.opencode_available(),
-            },
-            AgentInfo {
-                name: "claude".to_string(),
-                display_name: "Claude".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.claude_available(),
-            },
-            AgentInfo {
-                name: "droid".to_string(),
-                display_name: "Droid".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.droid_available(),
-            },
-            AgentInfo {
-                name: "hermes".to_string(),
-                display_name: "Hermes".to_string(),
-                wire: AgentWire::Jsonl,
-                available: self.hermes_available().await,
-            },
-        ]
+                }
+            } else {
+                manifest.wire.clone()
+            };
+            out.push(AgentInfo {
+                name: manifest.name.to_owned(),
+                display_name: manifest.display_name.to_owned(),
+                wire,
+                available,
+                presentation: Some(manifest.presentation()),
+                capabilities: Some(manifest.capabilities()),
+            });
+        }
+        out
+    }
+
+    /// Static manifest lookup for telemetry / debugging. Returns the
+    /// stable manifest for a known agent name, not the live availability
+    /// state.
+    #[allow(dead_code)]
+    pub fn manifest_for(name: &str) -> Option<&'static crate::agent_manifest::AgentManifest> {
+        manifest_for(name)
     }
 
     /// Session-aware dispatch: the iroh stream attaches to the supplied

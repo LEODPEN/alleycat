@@ -36,7 +36,58 @@ pub struct AgentInfo {
     pub display_name: String,
     pub wire: AgentWire,
     pub available: bool,
+    /// UI-facing presentation hints. Optional so older alleycat daemons
+    /// continue to round-trip without this field; new clients render
+    /// generic fallbacks when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<AgentPresentation>,
+    /// Behavioral capability flags that let clients branch on
+    /// agent-specific behavior (reasoning-effort lock, visible mode
+    /// allowlist, transport eligibility) without hardcoding agent names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<AgentCapabilities>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentPresentation {
+    /// Longer/formal title used in headers, e.g. "Factory Droid" while
+    /// `display_name` is "Droid". Falls back to `display_name` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Whether the BETA badge should be shown next to this agent.
+    #[serde(default)]
+    pub is_beta: bool,
+    /// Ascending sort key. Ties broken by `name`.
+    #[serde(default)]
+    pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Alternate lowercase names that should also resolve to this agent
+    /// (back-compat for clients that persisted a different alias).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentCapabilities {
+    /// Amp behavior: reasoning effort is locked once the thread has any
+    /// activity. Clients hide / disable the effort selector when true.
+    #[serde(default)]
+    pub locks_reasoning_effort_after_activity: bool,
+    /// Allowlist of mode names the model selector should show. `None`
+    /// means no filtering; show all modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_modes: Option<Vec<String>>,
+    /// Agent can be reached via the SSH bridge bootstrap path
+    /// (Claude / Pi / Opencode / Codex today).
+    #[serde(default)]
+    pub supports_ssh_bridge: bool,
+    /// Codex-only: the agent speaks the `codex app-server` wire and can
+    /// be dialed directly on its TCP port without going through Alleycat.
+    #[serde(default)]
+    pub uses_direct_codex_port: bool,
+}
+
 
 /// Resume hint sent on `Connect` when a reconnecting client wants to
 /// reattach to an existing session for `(client_node_id, agent)`. The server

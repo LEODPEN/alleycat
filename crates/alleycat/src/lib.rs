@@ -2,6 +2,7 @@
 //! and the `kittylitter` distribution wrapper in the litter repo) call
 //! [`run`] with their CLI display name.
 
+mod agent_manifest;
 mod agents;
 mod cli;
 mod config;
