@@ -97,7 +97,10 @@ pub fn binary_version() -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Iroh-backed bridge that multiplexes local coding agents for paired clients")]
+#[command(
+    version,
+    about = "Iroh-backed bridge that multiplexes local coding agents for paired clients"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
