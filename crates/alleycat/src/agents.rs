@@ -332,18 +332,19 @@ impl AgentManager {
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
         // Availability is computed per-agent (some are async, some not),
         // then each manifest is rendered to the wire `AgentInfo` shape.
+        let launch_env = self.daemon_launch_env().await;
         let mut out = Vec::with_capacity(MANIFESTS.len());
         for manifest in MANIFESTS {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
-                "pi" => self.pi_available(),
-                "amp" => self.amp_available(),
-                "opencode" => self.opencode_available(),
-                "claude" => self.claude_available(),
-                "droid" => self.droid_available(),
-                "hermes" => self.hermes_available().await,
-                "devin" => self.devin_available(),
-                "grok" => self.grok_available(),
+                "pi" => self.pi_available(&launch_env),
+                "amp" => self.amp_available(&launch_env),
+                "opencode" => self.opencode_available(&launch_env),
+                "claude" => self.claude_available(&launch_env),
+                "droid" => self.droid_available(&launch_env),
+                "hermes" => self.hermes_available(&launch_env).await,
+                "devin" => self.devin_available(&launch_env),
+                "grok" => self.grok_available(&launch_env),
                 "shell" => self.shell_available(),
                 _ => false,
             };
@@ -939,45 +940,45 @@ impl AgentManager {
         self.launch_env.resolve(cwd.as_deref()).await
     }
 
-    fn pi_available(&self) -> bool {
+    fn pi_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin).is_some()
+        cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin, env).is_some()
     }
 
-    fn opencode_available(&self) -> bool {
+    fn opencode_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.opencode.enabled
-            && (std::env::var_os("OPENCODE_BRIDGE_BACKEND_URL").is_some()
-                || which::which(&cfg.agents.opencode.bin).is_ok())
+            && (env_non_empty(env, "OPENCODE_BRIDGE_BACKEND_URL")
+                || program_available(env, &cfg.agents.opencode.bin))
     }
 
-    fn amp_available(&self) -> bool {
+    fn amp_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.amp.enabled
-            && which::which(&cfg.agents.amp.bin).is_ok()
-            && has_amp_auth(&cfg.agents.amp.api_key_env)
+            && program_available(env, &cfg.agents.amp.bin)
+            && has_amp_auth(&cfg.agents.amp.api_key_env, env)
     }
 
-    fn claude_available(&self) -> bool {
+    fn claude_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.claude.enabled && which::which(&cfg.agents.claude.bin).is_ok()
+        cfg.agents.claude.enabled && program_available(env, &cfg.agents.claude.bin)
     }
 
-    fn droid_available(&self) -> bool {
+    fn droid_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.droid.enabled
-            && which::which(&cfg.agents.droid.bin).is_ok()
-            && has_factory_auth(&cfg.agents.droid.api_key_env)
+            && program_available(env, &cfg.agents.droid.bin)
+            && has_factory_auth(&cfg.agents.droid.api_key_env, env)
     }
 
-    fn devin_available(&self) -> bool {
+    fn devin_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.devin.enabled && which::which(&cfg.agents.devin.bin).is_ok()
+        cfg.agents.devin.enabled && program_available(env, &cfg.agents.devin.bin)
     }
 
-    fn grok_available(&self) -> bool {
+    fn grok_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
-        cfg.agents.grok.enabled && which::which(&cfg.agents.grok.bin).is_ok()
+        cfg.agents.grok.enabled && program_available(env, &cfg.agents.grok.bin)
     }
 
     fn shell_available(&self) -> bool {
@@ -985,7 +986,7 @@ impl AgentManager {
         cfg.agents.shell.enabled && which::which(&cfg.agents.shell.shell_bin).is_ok()
     }
 
-    async fn hermes_available(&self) -> bool {
+    async fn hermes_available(&self, env: &LaunchEnvironment) -> bool {
         let (enabled, bin, api_base) = {
             let cfg = self.config.load();
             (
@@ -994,7 +995,7 @@ impl AgentManager {
                 cfg.agents.hermes.api_base.clone(),
             )
         };
-        enabled && (which::which(&bin).is_ok() || hermes_api_available(&api_base).await)
+        enabled && (program_available(env, &bin) || hermes_api_available(&api_base).await)
     }
 }
 
@@ -1025,6 +1026,9 @@ async fn terminate_codex_child(child: &mut Child, label: &'static str) {
 }
 
 async fn terminate_codex_child_tree(child: &mut Child, label: &'static str) {
+    #[cfg(not(windows))]
+    let _ = label;
+
     #[cfg(windows)]
     if let Some(pid) = child.id() {
         let mut taskkill = Command::new("taskkill.exe");
@@ -1073,10 +1077,17 @@ fn codex_command(bin: &Path) -> Command {
         return command;
     }
 
-    let mut command = Command::new(bin);
     #[cfg(windows)]
-    hide_windows_console(&mut command);
-    command
+    {
+        let mut command = Command::new(bin);
+        hide_windows_console(&mut command);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new(bin)
+    }
 }
 
 #[cfg(windows)]
@@ -1404,13 +1415,13 @@ fn pi_program_aliases() -> [(OsString, Vec<OsString>); 2] {
 /// users with stale config or non-canonical install layouts still get the
 /// agent reported as available and spawn against a binary that actually
 /// exists. Returns the resolved name (the one that should be invoked).
-fn resolve_pi_bin(configured: &str) -> Option<PathBuf> {
-    if let Some(path) = which::which(configured).ok() {
+fn resolve_pi_bin(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
+    if let Some(path) = resolve_program(configured, env) {
         return Some(path);
     }
     for alias in ["pi", "pi-coding-agent"] {
         if alias != configured
-            && let Some(path) = which::which(alias).ok()
+            && let Some(path) = resolve_program(alias, env)
         {
             return Some(path);
         }
@@ -1463,29 +1474,61 @@ impl crate::config::AgentsConfig {
     }
 }
 
-fn has_factory_auth(api_key_env: &str) -> bool {
-    if std::env::var_os(api_key_env).is_some() {
+fn program_available(env: &LaunchEnvironment, configured: &str) -> bool {
+    resolve_program(configured, env).is_some()
+}
+
+fn resolve_program(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
+    let path = Path::new(configured);
+    if path.components().count() > 1 {
+        return is_executable_file(path).then_some(path.to_path_buf());
+    }
+    env.find_on_path(configured)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn env_non_empty(env: &LaunchEnvironment, key: &str) -> bool {
+    env.get(key).is_some_and(|value| !value.is_empty())
+}
+
+fn has_factory_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
+    if env.get(api_key_env).is_some() {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = env_path(env, "HOME") else {
         return false;
     };
-    let factory_dir = PathBuf::from(home).join(".factory");
+    let factory_dir = home.join(".factory");
     factory_dir.join("auth.encrypted").is_file()
         || (factory_dir.join("auth.v2.file").is_file() && factory_dir.join("auth.v2.key").is_file())
 }
 
-fn has_amp_auth(api_key_env: &str) -> bool {
-    if std::env::var_os(api_key_env).is_some() {
+fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
+    if env.get(api_key_env).is_some() {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = env_path(env, "HOME") else {
         return false;
     };
-    let home = PathBuf::from(home);
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"));
+    let data_home = env_path(env, "XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
     data_home.join("amp/secrets.json").is_file() || home.join(".amp/oauth").is_dir()
 }
 
@@ -1502,13 +1545,42 @@ mod tests {
         let api_key_env = "ALLEYCAT_TEST_FACTORY_API_KEY_UNSET";
         unsafe { std::env::remove_var(api_key_env) };
 
-        assert!(!has_factory_auth(api_key_env));
+        assert!(!has_factory_auth(
+            api_key_env,
+            &LaunchEnvironment::current()
+        ));
 
         std::fs::write(factory_dir.join("auth.v2.file"), b"auth").unwrap();
-        assert!(!has_factory_auth(api_key_env));
+        assert!(!has_factory_auth(
+            api_key_env,
+            &LaunchEnvironment::current()
+        ));
 
         std::fs::write(factory_dir.join("auth.v2.key"), b"key").unwrap();
-        assert!(has_factory_auth(api_key_env));
+        assert!(has_factory_auth(api_key_env, &LaunchEnvironment::current()));
+    }
+
+    #[test]
+    fn resolved_environment_controls_program_availability() {
+        let mut home = crate::test_support::TempHome::new();
+        let bin_dir = home.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let agent_bin = bin_dir.join("agent");
+        std::fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&agent_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&agent_bin, perms).unwrap();
+        }
+
+        home.override_env(&[("PATH", bin_dir.to_str().unwrap())]);
+        let env = LaunchEnvironment::current();
+
+        assert!(program_available(&env, "agent"));
+        assert_eq!(resolve_pi_bin("pi", &env), None);
     }
 
     #[test]
