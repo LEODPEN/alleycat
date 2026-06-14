@@ -25,6 +25,76 @@ Use `alleycat` instead of `kittylitter` when running a source build from this re
 
 The `install` command registers a launchd user agent on macOS, a systemd `--user` unit on Linux (with `.desktop` autostart fallback), or a Startup-folder shortcut on Windows. None of them require sudo.
 
+## Use a source clone with your own phone
+
+Each person should run Alleycat on their own computer and pair their own phone
+with the QR code generated on that computer. Do not reuse another user's
+`host.toml`, token, or pair QR.
+
+```bash
+git clone https://github.com/LEODPEN/alleycat.git
+cd alleycat
+```
+
+First make sure the local Codex CLI works:
+
+```bash
+codex --version
+codex app-server --help
+```
+
+On Apple Silicon Macs, build an arm64 binary explicitly:
+
+```bash
+rustup target add aarch64-apple-darwin
+CARGO_HTTP_MULTIPLEXING=false cargo build --target aarch64-apple-darwin -p alleycat --release
+file ./target/aarch64-apple-darwin/release/alleycat
+```
+
+The `file` output should say `arm64`. If Alleycat is built as `x86_64` on an
+Apple Silicon Mac, macOS may launch the Node-based Codex wrapper under Rosetta
+and Codex can look for the wrong optional package.
+
+Run the daemon in the foreground while testing:
+
+```bash
+./target/aarch64-apple-darwin/release/alleycat status
+./target/aarch64-apple-darwin/release/alleycat serve
+```
+
+In another terminal, print the QR for the phone:
+
+```bash
+./target/aarch64-apple-darwin/release/alleycat pair --qr
+```
+
+The phone app scans that QR to connect to this computer. To run Alleycat in the
+background instead:
+
+```bash
+./target/aarch64-apple-darwin/release/alleycat install
+./target/aarch64-apple-darwin/release/alleycat status
+./target/aarch64-apple-darwin/release/alleycat stop
+./target/aarch64-apple-darwin/release/alleycat uninstall
+```
+
+On Intel Macs and most Linux machines, the default target is usually correct:
+
+```bash
+cargo build --release -p alleycat
+./target/release/alleycat serve
+./target/release/alleycat pair --qr
+```
+
+Pairing grants access to the local agents exposed by this daemon. Only share the
+QR with trusted clients. If a QR or token is exposed, rotate it and pair phones
+again:
+
+```bash
+./target/aarch64-apple-darwin/release/alleycat rotate
+./target/aarch64-apple-darwin/release/alleycat pair --qr
+```
+
 The daemon spawns external coding-agent CLIs on demand — install whichever ones you'll use:
 
 | Agent | Install |
