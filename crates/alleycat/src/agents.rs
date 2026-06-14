@@ -531,7 +531,19 @@ impl AgentManager {
 
     async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
         let endpoint = if self.codex_mode == CodexMode::UnixDaemon {
-            self.ensure_codex_daemon_running().await?
+            match self.ensure_codex_daemon_running().await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(
+                        "codex app-server daemon start failed; falling back to legacy unix app-server launch: {error:#}"
+                    );
+                    self.ensure_codex_unix_running().await.with_context(|| {
+                        format!(
+                            "codex app-server daemon start failed ({error:#}) and legacy unix app-server fallback also failed"
+                        )
+                    })?
+                }
+            }
         } else {
             self.ensure_codex_unix_running().await?
         };
@@ -1168,10 +1180,14 @@ async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
             }
         };
         if !output.status.success() {
+            let stdout = truncate_log_output(&String::from_utf8_lossy(&output.stdout));
+            let stderr = truncate_log_output(&String::from_utf8_lossy(&output.stderr));
             warn!(
                 status = %output.status,
                 configured_bin = %bin,
                 bin = %candidate.display(),
+                stdout = %stdout,
+                stderr = %stderr,
                 "codex app-server --help exited unsuccessfully"
             );
             continue;
@@ -1204,6 +1220,17 @@ async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
         bin: fallback_bin,
         available: false,
     }
+}
+
+fn truncate_log_output(output: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut truncated = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn codex_app_server_proxy_supported(bin: &Path, env: &LaunchEnvironment) -> bool {
